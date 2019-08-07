@@ -1,0 +1,14 @@
+[package]
+name = "s3-sync"
+version = "0.1.0"
+authors = ["Jakub Pastuszek <jpastuszek@protonmail.com>"]
+edition = "2018"
+
+[dependencies]
+rusoto_s3 = "0.40.0"
+rusoto_core = "0.40.0"
+derive_more = "0.15.0"
+log = "0.4.8"
+itertools = "0.8.0"
+ensure = "0.2.0"
+either = "1.5.2"
