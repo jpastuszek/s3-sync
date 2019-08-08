@@ -12,6 +12,7 @@ use itertools::unfold;
 use std::time::Duration;
 use std::io::Read;
 use std::error::Error;
+use std::fmt;
 use ensure::{Absent, Present, Ensure, Meet};
 use ensure::CheckEnsureResult::*;
 use either::Either;
@@ -22,6 +23,26 @@ pub enum S3SyncError {
     RusotoError(Box<dyn Error>),
     IoError(std::io::Error),
     NoBodyError,
+}
+
+impl fmt::Display for S3SyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            S3SyncError::RusotoError(_) => write!(f, "error executing AWS operation"),
+            S3SyncError::IoError(_) => write!(f, "local I/O error"),
+            S3SyncError::NoBodyError => write!(f, "expected body but found none"),
+        }
+    }
+}
+
+impl Error for S3SyncError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            S3SyncError::RusotoError(err) => Some(err.as_ref()),
+            S3SyncError::IoError(err) => Some(err),
+            S3SyncError::NoBodyError => None,
+        }
+    }
 }
 
 impl<T: Error + 'static> From<RusotoError<T>> for S3SyncError {
@@ -205,7 +226,7 @@ impl S3 {
     }
 
     pub fn put_object_body(&self, bucket: String, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
-        use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest};
+        use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest};
         use rusoto_core::ByteStream;
         use futures::stream;
         use bytes::Bytes;
@@ -219,33 +240,49 @@ impl S3 {
         .with_timeout(Duration::from_secs(300)).sync()?
         .upload_id.expect("no upload ID");
 
-        //TODO: configurable
-        let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
-        let body = &mut body;
+        info!("Started multipart upload {:?}", upload_id);
+        
+        let result = || -> Result<_, S3SyncError> {
+            //TODO: configurable
+            let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
+            let body = &mut body;
 
-        for part_number in 0.. {
-            let mut buf = Vec::new();
-            body.take(chunk_size).read_to_end(&mut buf)?;
-            let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
+            for part_number in 0.. {
+                let mut buf = Vec::new();
+                let bytes = body.take(chunk_size).read_to_end(&mut buf)?;
+                let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
 
-            self.client.upload_part(UploadPartRequest {
-                body: Some(body),
-                bucket: bucket.clone(),
+                info!("Uploading part {} ({} bytes)", part_number, bytes);
+                self.client.upload_part(UploadPartRequest {
+                    body: Some(body),
+                    bucket: bucket.clone(),
+                    key: object.0.key.clone(),
+                    part_number,
+                    upload_id: upload_id.clone(),
+                    .. Default::default()
+                }).with_timeout(Duration::from_secs(300)).sync()?;
+            }
+
+            info!("Multipart upload {:?} complete", upload_id);
+            self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
+                bucket,
                 key: object.0.key.clone(),
-                part_number,
                 upload_id: upload_id.clone(),
+                .. Default::default()
+            }).with_timeout(Duration::from_secs(300)).sync()?;
+
+            Ok(Present(object.0))
+        }();
+
+        if let Err(err) = &result {
+            error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
+            self.client.abort_multipart_upload(AbortMultipartUploadRequest {
+                upload_id,
                 .. Default::default()
             }).with_timeout(Duration::from_secs(300)).sync()?;
         }
 
-        self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
-            bucket,
-            key: object.0.key.clone(),
-            upload_id,
-            .. Default::default()
-        }).with_timeout(Duration::from_secs(300)).sync()?;
-
-        Ok(Present(object.0))
+        result
     }
 
     pub fn delete_objects(&self, bucket: String, objects: Vec<Present<Object>>) -> Result<Vec<Absent<Object>>, S3SyncError> {
