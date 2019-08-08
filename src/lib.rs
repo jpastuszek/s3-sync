@@ -136,12 +136,12 @@ impl From<S3Object> for Object {
 //     }
 // }
 
-pub fn object_present<'s, R: Read + 's, F: FnOnce() -> R + 's>(s3: &'s S3, bucket: Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
+pub fn object_present<'s, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(s3: &'s S3, bucket: Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
     move || {
         Ok(match s3.check_object_exists(&bucket, object.clone())? {
             Left(present) => Met(present),
             Right(absent) => EnsureAction(move || {
-                s3.put_object_body(bucket, absent, body())
+                s3.put_object_body(bucket, absent, body()?)
             })
         })
     }
@@ -389,16 +389,15 @@ impl S3 {
     }
 }
 
+#[cfg(feature = "test-s3")]
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "test-s3")]
     pub fn s3_test_bucket() -> Bucket {
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set").into()
     }
 
-    #[cfg(feature = "test-s3")]
     #[test]
     fn test_object_present() {
         use std::io::Cursor;
@@ -407,6 +406,6 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        object_present(&s3, bucket, "/s3-sync-test/foo".to_owned().into(), move || body).ensure().or_failed_to("make object present");
+        object_present(&s3, bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
     }
 }
