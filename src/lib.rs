@@ -17,10 +17,11 @@ use ensure::{Absent, Present, Ensure, Meet};
 use ensure::CheckEnsureResult::*;
 use either::Either;
 use Either::*;
+use problem::prelude::*;
 
 #[derive(Debug)]
 pub enum S3SyncError {
-    RusotoError(Box<dyn Error>),
+    RusotoError(RusotoError<Box<dyn Error + 'static>>),
     IoError(std::io::Error),
     NoBodyError,
 }
@@ -28,7 +29,14 @@ pub enum S3SyncError {
 impl fmt::Display for S3SyncError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            S3SyncError::RusotoError(_) => write!(f, "error executing AWS operation"),
+            S3SyncError::RusotoError(err) => match err {
+                RusotoError::Service(err) => write!(f, "AWS service-specific error occurred: {}", err),
+                RusotoError::HttpDispatch(err) => write!(f, "AWS error occurred dispatching the HTTP request: {}", err),
+                RusotoError::Credentials(err) => write!(f, "AWS error was encountered with credentials: {}", err),
+                RusotoError::Validation(err) => write!(f, "AWS validation error occurred: {}", err),
+                RusotoError::ParseError(err) => write!(f, "AWS error occurred parsing the response payload: {}", err),
+                RusotoError::Unknown(err) => write!(f, "unknown AWS error occurred: {:?}", err),
+            },
             S3SyncError::IoError(_) => write!(f, "local I/O error"),
             S3SyncError::NoBodyError => write!(f, "expected body but found none"),
         }
@@ -38,7 +46,7 @@ impl fmt::Display for S3SyncError {
 impl Error for S3SyncError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            S3SyncError::RusotoError(err) => Some(err.as_ref()),
+            S3SyncError::RusotoError(_) => None,
             S3SyncError::IoError(err) => Some(err),
             S3SyncError::NoBodyError => None,
         }
@@ -47,7 +55,14 @@ impl Error for S3SyncError {
 
 impl<T: Error + 'static> From<RusotoError<T>> for S3SyncError {
     fn from(err: RusotoError<T>) -> S3SyncError {
-        S3SyncError::RusotoError(Box::new(err))
+        match err {
+            RusotoError::Service(err) => S3SyncError::RusotoError(RusotoError::Service(Box::new(err))),
+            RusotoError::HttpDispatch(err) => S3SyncError::RusotoError(RusotoError::HttpDispatch(err)),
+            RusotoError::Credentials(err) => S3SyncError::RusotoError(RusotoError::Credentials(err)),
+            RusotoError::Validation(err) => S3SyncError::RusotoError(RusotoError::Validation(err)),
+            RusotoError::ParseError(err) => S3SyncError::RusotoError(RusotoError::ParseError(err)),
+            RusotoError::Unknown(err) => S3SyncError::RusotoError(RusotoError::Unknown(err)),
+        }
     }
 }
 
@@ -71,6 +86,19 @@ impl Object {
 impl From<String> for Object {
     fn from(key: String) -> Object {
         Object::from_key(key)
+    }
+}
+
+#[derive(Debug, Display, FromStr, Clone)]
+pub struct Bucket {
+    pub name: String
+}
+
+impl From<String> for Bucket {
+    fn from(name: String) -> Bucket {
+        Bucket {
+            name
+        }
     }
 }
 
@@ -108,12 +136,12 @@ impl From<S3Object> for Object {
 //     }
 // }
 
-pub fn object_present<'s>(s3: &'s S3, bucket: String, object: Object, body: impl Read + 's) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
+pub fn object_present<'s, R: Read + 's, F: FnOnce() -> R + 's>(s3: &'s S3, bucket: Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
     move || {
-        Ok(match s3.check_object_exists(bucket.clone(), object.clone())? {
+        Ok(match s3.check_object_exists(&bucket, object.clone())? {
             Left(present) => Met(present),
             Right(absent) => EnsureAction(move || {
-                s3.put_object_body(bucket, absent, body)
+                s3.put_object_body(bucket, absent, body())
             })
         })
     }
@@ -158,20 +186,41 @@ impl S3 {
         }
     }
 
-    pub fn check_object_exists(&self, bucket: String, object: Object) -> Result<Either<Present<Object>, Absent<Object>>, S3SyncError> {
+    pub fn check_bucket_exists(&self, bucket: Bucket) -> Result<Either<Present<Bucket>, Absent<Bucket>>, S3SyncError> {
+        use rusoto_s3::HeadBucketRequest;
+        use rusoto_s3::HeadBucketError;
+        use rusoto_core::request::BufferedHttpResponse;
+
+        let res = dbg!{self.client.head_bucket(HeadBucketRequest {
+            bucket: bucket.name.clone(),
+            .. Default::default()
+        }).with_timeout(Duration::from_secs(10)).sync()};
+        debug!("Head bucket response: {:?}", res);
+
+        match res {
+            Ok(_) => Ok(Left(Present(bucket))),
+            Err(RusotoError::Service(HeadBucketError::NoSuchBucket(_))) => Ok(Right(Absent(bucket))),
+            Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(bucket))),
+            Err(err) => Err(err.into())
+        }
+    }
+
+    pub fn check_object_exists(&self, bucket: &Present<Bucket>, object: Object) -> Result<Either<Present<Object>, Absent<Object>>, S3SyncError> {
         use rusoto_s3::HeadObjectRequest;
         use rusoto_s3::HeadObjectError;
+        use rusoto_core::request::BufferedHttpResponse;
 
-        let res = self.client.head_object(HeadObjectRequest {
-            bucket,
+        let res = dbg!{self.client.head_object(HeadObjectRequest {
+            bucket: bucket.0.name.clone(),
             key: object.key.clone(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(10)).sync();
+        }).with_timeout(Duration::from_secs(10)).sync()};
         debug!("Head response: {:?}", res);
 
         match res {
             Ok(_) => Ok(Left(Present(object))),
             Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => Ok(Right(Absent(object))),
+            Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(object))),
             Err(err) => Err(err.into())
         }
     }
@@ -225,61 +274,77 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
-    pub fn put_object_body(&self, bucket: String, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
-        use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest};
+    pub fn put_object_body(&self, bucket: Present<Bucket>, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
+        use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
-        use futures::stream;
-        use bytes::Bytes;
 
-        let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
-            bucket: bucket.clone(),
+        let upload_id = dbg!{self.client.create_multipart_upload(dbg!{CreateMultipartUploadRequest {
+            bucket: bucket.0.name.clone(),
             key: object.0.key.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
             //TODO: content_type, storage_clase etc.
             .. Default::default()
-        })
-        .with_timeout(Duration::from_secs(300)).sync()?
+        }})
+        .with_timeout(Duration::from_secs(300)).sync()}?
         .upload_id.expect("no upload ID");
 
         info!("Started multipart upload {:?}", upload_id);
+
+        let mut completed_parts = Vec::new();
         
         let result = || -> Result<_, S3SyncError> {
             //TODO: configurable
             let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
             let body = &mut body;
 
-            for part_number in 0.. {
-                let mut buf = Vec::new();
-                let bytes = body.take(chunk_size).read_to_end(&mut buf)?;
-                let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
+            for part_number in 1.. {
+                let mut buf = Vec::with_capacity(chunk_size);
+                let bytes = body.take(chunk_size as u64).read_to_end(&mut buf)?;
+                if bytes == 0 {
+                    break
+                }
+
+                //let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
+                let body = ByteStream::from(buf);
 
                 info!("Uploading part {} ({} bytes)", part_number, bytes);
-                self.client.upload_part(UploadPartRequest {
+                let result = dbg![self.client.upload_part(dbg!{UploadPartRequest {
                     body: Some(body),
-                    bucket: bucket.clone(),
+                    bucket: bucket.0.name.clone(),
                     key: object.0.key.clone(),
                     part_number,
                     upload_id: upload_id.clone(),
                     .. Default::default()
-                }).with_timeout(Duration::from_secs(300)).sync()?;
+                }}).with_timeout(Duration::from_secs(300)).sync()]?;
+                
+                completed_parts.push(CompletedPart {
+                    e_tag: result.e_tag,
+                    part_number: Some(part_number),
+                })
             }
 
             info!("Multipart upload {:?} complete", upload_id);
-            self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
-                bucket,
+            dbg![self.client.complete_multipart_upload(dbg!{CompleteMultipartUploadRequest {
+                bucket: bucket.0.name.clone(),
                 key: object.0.key.clone(),
                 upload_id: upload_id.clone(),
+                multipart_upload: Some(CompletedMultipartUpload {
+                    parts: Some(completed_parts)
+                }),
                 .. Default::default()
-            }).with_timeout(Duration::from_secs(300)).sync()?;
+            }}).with_timeout(Duration::from_secs(300)).sync()]?;
 
-            Ok(Present(object.0))
+            Ok(Present(object.0.clone()))
         }();
 
         if let Err(err) = &result {
             error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
-            self.client.abort_multipart_upload(AbortMultipartUploadRequest {
+            dbg![self.client.abort_multipart_upload(AbortMultipartUploadRequest {
+                bucket: bucket.0.name,
+                key: object.0.key,
                 upload_id,
                 .. Default::default()
-            }).with_timeout(Duration::from_secs(300)).sync()?;
+            }).with_timeout(Duration::from_secs(300)).sync()].ok_or_log_warn();
         }
 
         result
@@ -326,8 +391,22 @@ impl S3 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[cfg(feature = "test-s3")]
+    pub fn s3_test_bucket() -> Bucket {
+        std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set").into()
+    }
+
+    #[cfg(feature = "test-s3")]
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn test_object_present() {
+        use std::io::Cursor;
+
+        let s3 = S3::new();
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        object_present(&s3, bucket, "/s3-sync-test/foo".to_owned().into(), move || body).ensure().or_failed_to("make object present");
     }
 }
