@@ -6,49 +6,37 @@ use rusoto_s3::S3 as S3Trait;
 use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
 use rusoto_s3::Object as S3Object;
 use rusoto_s3::StreamingBody;
-use rusoto_s3::GetObjectRequest;
 use derive_more::{Display, FromStr};
 use log::{debug, info, error};
 use itertools::unfold;
 use std::time::Duration;
-use ensure::{Existential, Absent, Present};
+use std::io::Read;
+use std::error::Error;
+use ensure::{Absent, Present, Ensure, Meet};
+use ensure::CheckEnsureResult::*;
 use either::Either;
 use Either::*;
 
 #[derive(Debug)]
 pub enum S3SyncError {
-    ListObjectsError(RusotoError<rusoto_s3::ListObjectsV2Error>),
-    DeleteObjectsError(RusotoError<rusoto_s3::DeleteObjectsError>),
-    GetObjectError(RusotoError<rusoto_s3::GetObjectError>),
-    HeadObjectError(RusotoError<rusoto_s3::HeadObjectError>),
+    RusotoError(Box<dyn Error>),
+    IoError(std::io::Error),
     NoBodyError,
 }
 
-impl From<RusotoError<rusoto_s3::ListObjectsV2Error>> for S3SyncError {
-    fn from(err: RusotoError<rusoto_s3::ListObjectsV2Error>) -> S3SyncError {
-        S3SyncError::ListObjectsError(err)
+impl<T: Error + 'static> From<RusotoError<T>> for S3SyncError {
+    fn from(err: RusotoError<T>) -> S3SyncError {
+        S3SyncError::RusotoError(Box::new(err))
     }
 }
 
-impl From<RusotoError<rusoto_s3::DeleteObjectsError>> for S3SyncError {
-    fn from(err: RusotoError<rusoto_s3::DeleteObjectsError>) -> S3SyncError {
-        S3SyncError::DeleteObjectsError(err)
+impl From<std::io::Error> for S3SyncError {
+    fn from(err: std::io::Error) -> S3SyncError {
+        S3SyncError::IoError(err)
     }
 }
 
-impl From<RusotoError<rusoto_s3::GetObjectError>> for S3SyncError {
-    fn from(err: RusotoError<rusoto_s3::GetObjectError>) -> S3SyncError {
-        S3SyncError::GetObjectError(err)
-    }
-}
-
-impl From<RusotoError<rusoto_s3::HeadObjectError>> for S3SyncError {
-    fn from(err: RusotoError<rusoto_s3::HeadObjectError>) -> S3SyncError {
-        S3SyncError::HeadObjectError(err)
-    }
-}
-
-#[derive(Debug, Display, FromStr)]
+#[derive(Debug, Display, FromStr, Clone)]
 pub struct Object {
     pub key: String
 }
@@ -98,6 +86,17 @@ impl From<S3Object> for Object {
 //         })
 //     }
 // }
+
+pub fn object_present<'s>(s3: &'s S3, bucket: String, object: Object, body: impl Read + 's) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
+    move || {
+        Ok(match s3.check_object_exists(bucket.clone(), object.clone())? {
+            Left(present) => Met(present),
+            Right(absent) => EnsureAction(move || {
+                s3.put_object_body(bucket, absent, body)
+            })
+        })
+    }
+}
 
 pub struct PaginationIter<RQ, RS, SSA, GSA, FF, E> where RQ: Clone, SSA: Fn(&mut RQ, String), GSA: Fn(&RS) -> Option<String>, FF: Fn(RQ) -> Result<RS, E> {
     request: RQ,
@@ -195,6 +194,7 @@ impl S3 {
     }
 
     pub fn get_object_body(&self, bucket: String, object: &Present<Object>) -> Result<StreamingBody, S3SyncError> {
+        use rusoto_s3::GetObjectRequest;
         self.client.get_object(GetObjectRequest {
             bucket,
             key: object.0.key.to_owned(),
@@ -202,6 +202,50 @@ impl S3 {
         }).with_timeout(Duration::from_secs(300)).sync()
         .map_err(Into::into)
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
+    }
+
+    pub fn put_object_body(&self, bucket: String, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
+        use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest};
+        use rusoto_core::ByteStream;
+        use futures::stream;
+        use bytes::Bytes;
+
+        let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: object.0.key.clone(),
+            //TODO: content_type, storage_clase etc.
+            .. Default::default()
+        })
+        .with_timeout(Duration::from_secs(300)).sync()?
+        .upload_id.expect("no upload ID");
+
+        //TODO: configurable
+        let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
+        let body = &mut body;
+
+        for part_number in 0.. {
+            let mut buf = Vec::new();
+            body.take(chunk_size).read_to_end(&mut buf)?;
+            let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
+
+            self.client.upload_part(UploadPartRequest {
+                body: Some(body),
+                bucket: bucket.clone(),
+                key: object.0.key.clone(),
+                part_number,
+                upload_id: upload_id.clone(),
+                .. Default::default()
+            }).with_timeout(Duration::from_secs(300)).sync()?;
+        }
+
+        self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket,
+            key: object.0.key.clone(),
+            upload_id,
+            .. Default::default()
+        }).with_timeout(Duration::from_secs(300)).sync()?;
+
+        Ok(Present(object.0))
     }
 
     pub fn delete_objects(&self, bucket: String, objects: Vec<Present<Object>>) -> Result<Vec<Absent<Object>>, S3SyncError> {
