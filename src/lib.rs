@@ -165,7 +165,7 @@ pub struct TransferProgress {
 pub struct S3 {
     client: S3Client,
     part_size: usize,
-    on_part_uploaded: Option<Box<dyn Fn(&TransferProgress)>>,
+    on_upload_progress: Option<Box<dyn Fn(&TransferProgress)>>,
 }
 
 impl S3 {
@@ -174,7 +174,7 @@ impl S3 {
         S3 {
             client: S3Client::new(region),
             part_size: part_size.into().unwrap_or(DEFAULT_PART_SIZE),
-            on_part_uploaded: None,
+            on_upload_progress: None,
         }
     }
 
@@ -187,9 +187,9 @@ impl S3 {
 
 
     /// Set callback on body upload progress.
-    pub fn on_part_uploaded(&mut self, callback: Box<dyn Fn(&TransferProgress)>) -> Option<Box<dyn Fn(&TransferProgress)>> {
-        let ret = self.on_part_uploaded.take();
-        self.on_part_uploaded = Some(callback);
+    pub fn on_upload_progress(&mut self, callback: impl Into<Box<dyn Fn(&TransferProgress)>>) -> Option<Box<dyn Fn(&TransferProgress)>> {
+        let ret = self.on_upload_progress.take();
+        self.on_upload_progress = Some(callback.into());
         ret
     }
 
@@ -301,7 +301,7 @@ impl S3 {
         let mut progress = TransferProgress::default();
 
         // Notify progress init
-        self.on_part_uploaded.as_ref().map(|c| c(&progress));
+        self.on_upload_progress.as_ref().map(|c| c(&progress));
 
         let result = || -> Result<_, S3SyncError> {
             //TODO: configurable
@@ -339,7 +339,7 @@ impl S3 {
                 progress.bytes += bytes as u64;
 
                 // Notify with progress
-                self.on_part_uploaded.as_ref().map(|c| c(&progress));
+                self.on_upload_progress.as_ref().map(|c| c(&progress));
             }
 
             // Read did not return any data
@@ -360,7 +360,7 @@ impl S3 {
 
             // Notify it is done
             progress.status = TransferStatus::Done;
-            self.on_part_uploaded.as_ref().map(|c| c(&progress));
+            self.on_upload_progress.as_ref().map(|c| c(&progress));
 
             Ok(Present(object.0.clone()))
         }();
@@ -376,7 +376,7 @@ impl S3 {
 
             // Notify it is has failed
             progress.status = TransferStatus::Failed;
-            self.on_part_uploaded.as_ref().map(|c| c(&progress));
+            self.on_upload_progress.as_ref().map(|c| c(&progress));
         }
 
         result
