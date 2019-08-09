@@ -163,10 +163,10 @@ impl S3 {
         use rusoto_s3::HeadBucketError;
         use rusoto_core::request::BufferedHttpResponse;
 
-        let res = dbg!{self.client.head_bucket(HeadBucketRequest {
+        let res = self.client.head_bucket(HeadBucketRequest {
             bucket: bucket.name.clone(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(10)).sync()};
+        }).with_timeout(Duration::from_secs(10)).sync();
         debug!("Head bucket response: {:?}", res);
 
         match res {
@@ -182,11 +182,11 @@ impl S3 {
         use rusoto_s3::HeadObjectError;
         use rusoto_core::request::BufferedHttpResponse;
 
-        let res = dbg!{self.client.head_object(HeadObjectRequest {
+        let res = self.client.head_object(HeadObjectRequest {
             bucket: bucket.0.name.clone(),
             key: object.key.clone(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(10)).sync()};
+        }).with_timeout(Duration::from_secs(10)).sync();
         debug!("Head response: {:?}", res);
 
         match res {
@@ -250,14 +250,14 @@ impl S3 {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
 
-        let upload_id = dbg!{self.client.create_multipart_upload(dbg!{CreateMultipartUploadRequest {
+        let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
             bucket: bucket.0.name.clone(),
             key: object.0.key.clone(),
             content_type: Some("application/octet-stream".to_owned()),
             //TODO: content_type, storage_clase etc.
             .. Default::default()
-        }})
-        .with_timeout(Duration::from_secs(300)).sync()}?
+        })
+        .with_timeout(Duration::from_secs(300)).sync()?
         .upload_id.expect("no upload ID");
 
         info!("Started multipart upload {:?}", upload_id);
@@ -272,6 +272,8 @@ impl S3 {
             for part_number in 1.. {
                 let mut buf = Vec::with_capacity(chunk_size);
                 let bytes = body.take(chunk_size as u64).read_to_end(&mut buf)?;
+
+                // Don't create 0 byte parts on EoF
                 if bytes == 0 {
                     break
                 }
@@ -280,14 +282,14 @@ impl S3 {
                 let body = ByteStream::from(buf);
 
                 info!("Uploading part {} ({} bytes)", part_number, bytes);
-                let result = dbg![self.client.upload_part(dbg!{UploadPartRequest {
+                let result = self.client.upload_part(UploadPartRequest {
                     body: Some(body),
                     bucket: bucket.0.name.clone(),
                     key: object.0.key.clone(),
                     part_number,
                     upload_id: upload_id.clone(),
                     .. Default::default()
-                }}).with_timeout(Duration::from_secs(300)).sync()]?;
+                }).with_timeout(Duration::from_secs(300)).sync()?;
 
                 completed_parts.push(CompletedPart {
                     e_tag: result.e_tag,
@@ -295,8 +297,13 @@ impl S3 {
                 })
             }
 
+            // Read did not return any data
+            if completed_parts.is_empty() {
+                return Err(S3SyncError::NoBodyError)
+            }
+
             info!("Multipart upload {:?} complete", upload_id);
-            dbg![self.client.complete_multipart_upload(dbg!{CompleteMultipartUploadRequest {
+            self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
                 bucket: bucket.0.name.clone(),
                 key: object.0.key.clone(),
                 upload_id: upload_id.clone(),
@@ -304,19 +311,19 @@ impl S3 {
                     parts: Some(completed_parts)
                 }),
                 .. Default::default()
-            }}).with_timeout(Duration::from_secs(300)).sync()]?;
+            }).with_timeout(Duration::from_secs(300)).sync()?;
 
             Ok(Present(object.0.clone()))
         }();
 
         if let Err(err) = &result {
             error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
-            dbg![self.client.abort_multipart_upload(AbortMultipartUploadRequest {
+            self.client.abort_multipart_upload(AbortMultipartUploadRequest {
                 bucket: bucket.0.name.clone(),
                 key: object.0.key,
                 upload_id,
                 .. Default::default()
-            }).with_timeout(Duration::from_secs(300)).sync()].ok_or_log_warn();
+            }).with_timeout(Duration::from_secs(300)).sync().ok_or_log_warn();
         }
 
         result
@@ -376,6 +383,17 @@ mod tests {
 
         let s3 = S3::new();
         let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        object_present(&s3, &bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
+    }
+
+    #[test]
+    fn test_object_present_empty_read() {
+        use std::io::Cursor;
+
+        let s3 = S3::new();
+        let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         object_present(&s3, &bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
