@@ -7,7 +7,7 @@ use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
 use rusoto_s3::Object as S3Object;
 use rusoto_s3::StreamingBody;
 use derive_more::{Display, FromStr};
-use log::{debug, info, error};
+use log::{debug, error};
 use itertools::unfold;
 use std::time::Duration;
 use std::io::Read;
@@ -202,7 +202,7 @@ impl S3 {
             bucket: bucket.name.clone(),
             .. Default::default()
         }).with_timeout(Duration::from_secs(10)).sync();
-        debug!("Head bucket response: {:?}", res);
+        trace!("Head bucket response: {:?}", res);
 
         match res {
             Ok(_) => Ok(Left(Present(bucket))),
@@ -222,7 +222,7 @@ impl S3 {
             key: object.key.clone(),
             .. Default::default()
         }).with_timeout(Duration::from_secs(10)).sync();
-        debug!("Head response: {:?}", res);
+        trace!("Head response: {:?}", res);
 
         match res {
             Ok(_) => Ok(Left(Present(object))),
@@ -295,7 +295,7 @@ impl S3 {
         .with_timeout(Duration::from_secs(300)).sync()?
         .upload_id.expect("no upload ID");
 
-        info!("Started multipart upload {:?}", upload_id);
+        debug!("Started multipart upload {:?}", upload_id);
 
         let mut completed_parts = Vec::new();
         let mut progress = TransferProgress::default();
@@ -319,7 +319,7 @@ impl S3 {
                 //let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
                 let body = ByteStream::from(buf);
 
-                info!("Uploading part {} ({} bytes)", part_number, bytes);
+                debug!("Uploading part {} ({} bytes)", part_number, bytes);
                 let result = self.client.upload_part(UploadPartRequest {
                     body: Some(body),
                     bucket: bucket.0.name.clone(),
@@ -347,7 +347,7 @@ impl S3 {
                 return Err(S3SyncError::NoBodyError)
             }
 
-            info!("Multipart upload {:?} complete", upload_id);
+            debug!("Multipart upload {:?} complete", upload_id);
             self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
                 bucket: bucket.0.name.clone(),
                 key: object.0.key.clone(),
@@ -384,7 +384,7 @@ impl S3 {
 
     pub fn delete_objects(&self, bucket: String, objects: Vec<Present<Object>>) -> Result<Vec<Absent<Object>>, S3SyncError> {
         objects.chunks(1000).map(|chunk| {
-            info!("Deleting batch of {} objects from S3 bucket '{}'", chunk.len(), &bucket);
+            debug!("Deleting batch of {} objects from S3 bucket '{}'", chunk.len(), &bucket);
             let res = self.client.delete_objects(DeleteObjectsRequest {
                 bucket: bucket.clone(),
                 delete: Delete {
@@ -395,7 +395,7 @@ impl S3 {
                     .. Default::default()
                 }, .. Default::default()
             }).with_timeout(Duration::from_secs(60)).sync()?;
-            debug!("Delete response: {:?}", res);
+            trace!("Delete response: {:?}", res);
 
             if let Some(errors) = res.errors {
                 for error in errors {
@@ -406,7 +406,7 @@ impl S3 {
             }
 
             Ok(if let Some(deleted) = res.deleted {
-                info!("Deleted {} objects", deleted.len());
+                debug!("Deleted {} objects", deleted.len());
                 deleted.into_iter().filter_map(|deleted| deleted.key).collect::<Vec<_>>()
             } else {
                 Vec::new()
