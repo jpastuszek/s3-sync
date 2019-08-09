@@ -108,35 +108,7 @@ impl From<S3Object> for Object {
     }
 }
 
-// pub fn objects_absent(bucket: String, objects: Vec<impl Into<Object>>) -> 
-// impl Promise<Met = Vec<Absent<Object>>, Meet = impl Meet<Met = (Vec<Absent<Object>>, Vec<Absent<Object>>)>> {
-//     move || {
-//         let s3 = S3::new();
-//         let mut existing_objects = Vec::new();
-//         let mut non_existing_objects = Vec::new();
-
-//         for object in objects.into_iter().map(Into::into) {
-//             let key = object.key.to_owned();
-//             in_context_of_with(|| format!("checking if object with key '{}' exists in bucket '{}'", key, bucket.clone()), || {
-//                 s3.check_object_exists(bucket.clone(), object).map(|res| match res {
-//                     Left(Present) => existing_objects.push(Present),
-//                     Right(non_existing) => non_existing_objects.push(non_existing),
-//                 })
-//             })?
-//         }
-
-//         Ok(if existing_objects.is_empty() {
-//             Left(non_existing_objects)
-//         } else {
-//             Right(move || {
-//                 let deleted = s3.delete_objects(bucket, existing_objects)?;
-//                 Ok((deleted, non_existing_objects))
-//             })
-//         })
-//     }
-// }
-
-pub fn object_present<'s, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(s3: &'s S3, bucket: Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
+pub fn object_present<'s, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(s3: &'s S3, bucket: &'s Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
     move || {
         Ok(match s3.check_object_exists(&bucket, object.clone())? {
             Left(present) => Met(present),
@@ -244,7 +216,7 @@ impl S3 {
             },
             done: false
         };
-        
+
         pages.flat_map(|response| {
             let mut error = None;
             let mut objects = None;
@@ -274,7 +246,7 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
-    pub fn put_object_body(&self, bucket: Present<Bucket>, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
+    pub fn put_object_body(&self, bucket: &Present<Bucket>, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
 
@@ -291,7 +263,7 @@ impl S3 {
         info!("Started multipart upload {:?}", upload_id);
 
         let mut completed_parts = Vec::new();
-        
+
         let result = || -> Result<_, S3SyncError> {
             //TODO: configurable
             let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
@@ -316,7 +288,7 @@ impl S3 {
                     upload_id: upload_id.clone(),
                     .. Default::default()
                 }}).with_timeout(Duration::from_secs(300)).sync()]?;
-                
+
                 completed_parts.push(CompletedPart {
                     e_tag: result.e_tag,
                     part_number: Some(part_number),
@@ -340,7 +312,7 @@ impl S3 {
         if let Err(err) = &result {
             error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
             dbg![self.client.abort_multipart_upload(AbortMultipartUploadRequest {
-                bucket: bucket.0.name,
+                bucket: bucket.0.name.clone(),
                 key: object.0.key,
                 upload_id,
                 .. Default::default()
@@ -367,7 +339,7 @@ impl S3 {
 
             if let Some(errors) = res.errors {
                 for error in errors {
-                    error!("Error deleting S3 object '{}': {}", 
+                    error!("Error deleting S3 object '{}': {}",
                         error.key.as_ref().map(|s| s.as_str()).unwrap_or("<None>"),
                         error.message.as_ref().map(|s| s.as_str()).unwrap_or("<None>"));
                 }
@@ -381,7 +353,7 @@ impl S3 {
             })
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|chunks| 
+        .map(|chunks|
             chunks.into_iter()
             .flat_map(|chunk| chunk)
             .map(|key| Absent(Object::from_key(key)))
@@ -406,6 +378,6 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        object_present(&s3, bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
+        object_present(&s3, &bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
     }
 }
