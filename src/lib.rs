@@ -169,7 +169,6 @@ pub struct S3 {
 }
 
 impl S3 {
-    // TODO: progress hook
     /// Crate new Rusoto based S3 client.
     pub fn new(region: Region, part_size: impl Into<Option<usize>>) -> S3 {
         S3 {
