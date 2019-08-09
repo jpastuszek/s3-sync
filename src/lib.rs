@@ -1,6 +1,6 @@
 use rusoto_s3::S3Client;
 use rusoto_s3::{DeleteObjectsRequest, Delete, ObjectIdentifier};
-use rusoto_core::region::Region;
+pub use rusoto_core::region::Region;
 use rusoto_core::RusotoError;
 use rusoto_s3::S3 as S3Trait;
 use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
@@ -18,6 +18,8 @@ use ensure::CheckEnsureResult::*;
 use either::Either;
 use Either::*;
 use problem::prelude::*;
+
+const DEFAULT_PART_SIZE: usize = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
 
 #[derive(Debug)]
 pub enum S3SyncError {
@@ -108,17 +110,6 @@ impl From<S3Object> for Object {
     }
 }
 
-pub fn object_present<'s, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(s3: &'s S3, bucket: &'s Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
-    move || {
-        Ok(match s3.check_object_exists(&bucket, object.clone())? {
-            Left(present) => Met(present),
-            Right(absent) => EnsureAction(move || {
-                s3.put_object_body(bucket, absent, body()?)
-            })
-        })
-    }
-}
-
 pub struct PaginationIter<RQ, RS, SSA, GSA, FF, E> where RQ: Clone, SSA: Fn(&mut RQ, String), GSA: Fn(&RS) -> Option<String>, FF: Fn(RQ) -> Result<RS, E> {
     request: RQ,
     // function that returns request parametrised to fetch next page
@@ -146,16 +137,61 @@ impl<RQ, RS, SSA, GSA, FF, E> Iterator for PaginationIter<RQ, RS, SSA, GSA, FF, 
     }
 }
 
+
+#[derive(Debug)]
+pub enum TransferStatus {
+    Init,
+    Progress,
+    Done,
+    Failed,
+}
+
+impl Default for TransferStatus {
+    fn default() -> Self {
+        TransferStatus::Init
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TransferProgress {
+    /// Status of the transfer.
+    pub status: TransferStatus,
+    /// Number of buffers or parts transferred.
+    pub buffers: u16,
+    /// Total number of bytes transferred.
+    pub bytes: u64,
+}
+
 pub struct S3 {
-    client: S3Client
+    client: S3Client,
+    part_size: usize,
+    on_part_uploaded: Option<Box<dyn Fn(&TransferProgress)>>,
 }
 
 impl S3 {
-    // https://rusoto.github.io/rusoto/rusoto_s3/index.html
-    pub fn new() -> S3 {
+    // TODO: progress hook
+    /// Crate new Rusoto based S3 client.
+    pub fn new(region: Region, part_size: impl Into<Option<usize>>) -> S3 {
         S3 {
-            client: S3Client::new(Region::EuWest1)
+            client: S3Client::new(region),
+            part_size: part_size.into().unwrap_or(DEFAULT_PART_SIZE),
+            on_part_uploaded: None,
         }
+    }
+
+    /// Maximum size of the multipart upload part.
+    ///
+    /// Useful to set up other I/O buffers accordingly.
+    pub fn part_size(&self) -> usize {
+        self.part_size
+    }
+
+
+    /// Set callback on body upload progress.
+    pub fn on_part_uploaded(&mut self, callback: Box<dyn Fn(&TransferProgress)>) -> Option<Box<dyn Fn(&TransferProgress)>> {
+        let ret = self.on_part_uploaded.take();
+        self.on_part_uploaded = Some(callback);
+        ret
     }
 
     pub fn check_bucket_exists(&self, bucket: Bucket) -> Result<Either<Present<Bucket>, Absent<Bucket>>, S3SyncError> {
@@ -263,15 +299,18 @@ impl S3 {
         info!("Started multipart upload {:?}", upload_id);
 
         let mut completed_parts = Vec::new();
+        let mut progress = TransferProgress::default();
+
+        // Notify progress init
+        self.on_part_uploaded.as_ref().map(|c| c(&progress));
 
         let result = || -> Result<_, S3SyncError> {
             //TODO: configurable
-            let chunk_size = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
             let body = &mut body;
 
-            for part_number in 1.. {
-                let mut buf = Vec::with_capacity(chunk_size);
-                let bytes = body.take(chunk_size as u64).read_to_end(&mut buf)?;
+            for part_number in 1u16.. {
+                let mut buf = Vec::with_capacity(self.part_size);
+                let bytes = body.take(self.part_size as u64).read_to_end(&mut buf)?;
 
                 // Don't create 0 byte parts on EoF
                 if bytes == 0 {
@@ -286,15 +325,22 @@ impl S3 {
                     body: Some(body),
                     bucket: bucket.0.name.clone(),
                     key: object.0.key.clone(),
-                    part_number,
+                    part_number: part_number as i64,
                     upload_id: upload_id.clone(),
                     .. Default::default()
                 }).with_timeout(Duration::from_secs(300)).sync()?;
 
                 completed_parts.push(CompletedPart {
                     e_tag: result.e_tag,
-                    part_number: Some(part_number),
-                })
+                    part_number: Some(part_number as i64),
+                });
+
+                progress.status = TransferStatus::Progress;
+                progress.buffers += 1;
+                progress.bytes += bytes as u64;
+
+                // Notify with progress
+                self.on_part_uploaded.as_ref().map(|c| c(&progress));
             }
 
             // Read did not return any data
@@ -313,6 +359,10 @@ impl S3 {
                 .. Default::default()
             }).with_timeout(Duration::from_secs(300)).sync()?;
 
+            // Notify it is done
+            progress.status = TransferStatus::Done;
+            self.on_part_uploaded.as_ref().map(|c| c(&progress));
+
             Ok(Present(object.0.clone()))
         }();
 
@@ -324,6 +374,10 @@ impl S3 {
                 upload_id,
                 .. Default::default()
             }).with_timeout(Duration::from_secs(300)).sync().ok_or_log_warn();
+
+            // Notify it is has failed
+            progress.status = TransferStatus::Failed;
+            self.on_part_uploaded.as_ref().map(|c| c(&progress));
         }
 
         result
@@ -366,6 +420,22 @@ impl S3 {
             .map(|key| Absent(Object::from_key(key)))
             .collect::<Vec<_>>())
     }
+
+    /// Ensure that object is present in S3 bucket.
+    ///
+    /// It will call body function to obtain Read object from which the data will be uploaded to S3
+    /// if object does not already exist there.
+    pub fn object_present<'s, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(&'s self, bucket: &'s Present<Bucket>, object: Object, body: F) -> impl Ensure<Present<Object>, EnsureAction = impl Meet<Met = Present<Object>, Error = S3SyncError> + 's> + 's {
+        move || {
+            Ok(match self.check_object_exists(&bucket, object.clone())? {
+                Left(present) => Met(present),
+                Right(absent) => EnsureAction(move || {
+                    self.put_object_body(bucket, absent, body()?)
+                })
+            })
+        }
+    }
+
 }
 
 #[cfg(feature = "test-s3")]
@@ -381,21 +451,21 @@ mod tests {
     fn test_object_present() {
         use std::io::Cursor;
 
-        let s3 = S3::new();
+        let s3 = S3::new(Region::EuWest1, None);
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        object_present(&s3, &bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
+        s3.object_present(&bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
     }
 
     #[test]
     fn test_object_present_empty_read() {
         use std::io::Cursor;
 
-        let s3 = S3::new();
+        let s3 = S3::new(Region::EuWest1, None);
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        object_present(&s3, &bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
+        s3.object_present(&bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
     }
 }
