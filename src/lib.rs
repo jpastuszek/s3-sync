@@ -158,8 +158,10 @@ pub struct TransferProgress {
     pub status: TransferStatus,
     /// Number of buffers or parts transferred.
     pub buffers: u16,
-    /// Total number of bytes transferred.
+    /// Number of bytes transferred since last progress.
     pub bytes: u64,
+    /// Total number of bytes transferred.
+    pub bytes_total: u64,
 }
 
 pub struct S3 {
@@ -336,7 +338,8 @@ impl S3 {
 
                 progress.status = TransferStatus::Progress;
                 progress.buffers += 1;
-                progress.bytes += bytes as u64;
+                progress.bytes = bytes as u64;
+                progress.bytes_total += bytes as u64;
 
                 // Notify with progress
                 self.on_upload_progress.as_ref().map(|c| c(&progress));
