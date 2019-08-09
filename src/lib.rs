@@ -187,9 +187,9 @@ impl S3 {
 
 
     /// Set callback on body upload progress.
-    pub fn on_upload_progress(&mut self, callback: impl Into<Box<dyn Fn(&TransferProgress)>>) -> Option<Box<dyn Fn(&TransferProgress)>> {
+    pub fn on_upload_progress(&mut self, callback: impl Fn(&TransferProgress) + 'static) -> Option<Box<dyn Fn(&TransferProgress)>> {
         let ret = self.on_upload_progress.take();
-        self.on_upload_progress = Some(callback.into());
+        self.on_upload_progress = Some(Box::new(callback));
         ret
     }
 
@@ -465,6 +465,18 @@ mod tests {
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        s3.object_present(&bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
+    }
+
+    #[test]
+    fn test_object_present_progress() {
+        use std::io::Cursor;
+
+        let mut s3 = S3::new(Region::EuWest1, None);
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        s3.on_upload_progress(|p| {dbg!{p};});
         s3.object_present(&bucket, "/s3-sync-test/foo".to_owned().into(), move || Ok(body)).ensure().or_failed_to("make object present");
     }
 }
