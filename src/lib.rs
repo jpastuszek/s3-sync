@@ -7,7 +7,7 @@ use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
 use rusoto_s3::Object as S3Object;
 use rusoto_s3::StreamingBody;
 use derive_more::{Display, FromStr};
-use log::{debug, error};
+use log::{trace, debug, error};
 use itertools::unfold;
 use std::time::Duration;
 use std::io::Read;
