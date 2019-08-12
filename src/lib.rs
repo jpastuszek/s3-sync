@@ -283,6 +283,7 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
+    //TODO: Object should be bucket + key
     pub fn put_object_body(&self, bucket: &Present<Bucket>, object: Absent<Object>, mut body: impl Read) -> Result<Present<Object>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
@@ -306,10 +307,10 @@ impl S3 {
         self.on_upload_progress.as_ref().map(|c| c(&progress));
 
         let result = || -> Result<_, S3SyncError> {
-            //TODO: configurable
             let body = &mut body;
 
             for part_number in 1u16.. {
+                //TODO: streaming bufs
                 let mut buf = Vec::with_capacity(self.part_size);
                 let bytes = body.take(self.part_size as u64).read_to_end(&mut buf)?;
 
@@ -369,7 +370,7 @@ impl S3 {
         }();
 
         if let Err(err) = &result {
-            error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
+            error!("Aborting multipart upload {:?} due to error: {}", upload_id, Problem::from_error_message(err));
             self.client.abort_multipart_upload(AbortMultipartUploadRequest {
                 bucket: bucket.0.name.clone(),
                 key: object.0.key,
