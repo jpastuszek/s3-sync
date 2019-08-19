@@ -109,7 +109,7 @@ impl<'b> Object<'b> {
 }
 
 /// Represents S3 bucket.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Bucket {
     name: String
 }
@@ -403,7 +403,12 @@ impl S3 {
         result
     }
 
-    pub fn delete_objects<'s, 'b>(&'s self, objects: Vec<Present<Object<'b>>>) -> Result<Vec<Absent<Object<'b>>>, S3SyncError> {
+    /// Deletes list of objects (can be in different buckets).
+    ///
+    /// This does not fail if object does not exist.
+    pub fn delete_objects<'s, 'b>(&'s self, mut objects: Vec<Object<'b>>) -> Result<Vec<Absent<Object<'b>>>, S3SyncError> {
+        objects.sort_by_key(|o| o.bucket);
+
         let groups = objects.into_iter().group_by(|o| o.bucket);
 
         groups.into_iter().map(|(bucket, objects)| {
@@ -529,9 +534,9 @@ mod tests {
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let objects = vec![
-            Present(Object::from_key(&bucket, test_key())),
-            Present(Object::from_key(&bucket, test_key())),
-            Present(Object::from_key(&bucket, test_key())),
+            Object::from_key(&bucket, "s3-sync-test/foo".to_owned()),
+            Object::from_key(&bucket, test_key()),
+            Object::from_key(&bucket, test_key()),
         ];
 
         s3.delete_objects(objects).or_failed_to("delete objects");
