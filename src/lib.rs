@@ -433,23 +433,11 @@ impl S3 {
     /// by bucket.
     ///
     /// Note that returned results are per batch of delte operations.
-    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) ->
-        Vec<
-            Result<
-                Vec<
-                    Result<
-                        Absent<Object<'b>>,
-                        (Object<'b>, S3SyncError)
-                    >
-                >,
-                S3SyncError
-            >
-        >
-        {
-        //Vec<Result<Vec<Absent<Object<'b>>>, Vec<(Object<'b>, S3SyncError)>>> {
-        //Vec<Result<Vec<Absent<Object<'b>>>, S3SyncError>> {
-        //impl Iterator<Item = Result<Vec<Absent<Object<'b>>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
-
+    ///
+    /// Returns `Err` if one of the batch delete calls failed.
+    /// If `Ok` is returned all batch delete calls succedded but each individual object could have
+    /// failed to be deleted.
+    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> Result<Vec<Result<Absent<Object<'b>>, (Object<'b>, S3SyncError)>>, S3SyncError> {
         let mut objects = objects.into_iter().map(|o| o.invalidate_state()).peekable();
 
         std::iter::from_fn(move || {
@@ -502,14 +490,18 @@ impl S3 {
                         }
                     }
 
-                    Ok(objects.into_iter().map(|(_k, o)| Ok(Absent(o)))
+                    // Result<Vec<Result<,>,>
+                    Ok(objects.into_iter()
+                        .map(|(_k, o)| Ok(Absent(o)))
                         .chain(failed_objects.into_iter().map(|oe| Err(oe)))
-                        .collect::<Vec<_>>())
+                        .collect::<Vec<Result<_, _>>>())
                 })
-                .collect::<Vec<_>>())
+                .collect::<Result<Vec<Vec<Result<_, _>>>, _>>()
+                .map(|ok: Vec<_>| ok.into_iter().flatten().collect::<Vec<Result<_, _>>>()))
+                // Option<Result<Vec<Result<,>,>>
         })
-        .flatten()
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>,_>>()
+        .map(|ok: Vec<_>| ok.into_iter().flatten().collect::<Vec<Result<_, _>>>())
     }
 
     /// Ensure that object is present in S3 bucket.
