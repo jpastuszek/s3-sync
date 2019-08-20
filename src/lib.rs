@@ -422,22 +422,19 @@ impl S3 {
         result
     }
 
-    //TODO: This should return iterator since we can be working with unbounded number of objects
-
     /// Deletes list of objects.
     ///
-    /// Delete call does not fail if object does not exist and terefore this method can work with any
+    /// Delete call does not fail if object does not exist and therefore this method can work with any
     /// `ExternalState` of the object.
     ///
     /// Note that objects can live in different buckets. In this case they will be deleted bucket
     /// by bucket.
     ///
-    /// Note that returned results are per batch of delte operations.
-    ///
-    /// Returns `Err` if one of the batch delete calls failed.
-    /// If `Ok` is returned all batch delete calls succedded but each individual object could have
+    /// Each returned items represent batch delete call to S3.
+    /// Item is of `Err` variant for call that failed entirely.
+    /// When `Ok` variant is returned the batch delete call succeeded but each individual object could have
     /// failed to be deleted.
-    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> Result<Vec<Result<Absent<Object<'b>>, (Object<'b>, S3SyncError)>>, S3SyncError> {
+    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<Object<'b>>, (Object<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         let mut objects = objects.into_iter().map(|o| o.invalidate_state()).peekable();
 
         std::iter::from_fn(move || {
@@ -500,8 +497,6 @@ impl S3 {
                 .map(|ok: Vec<_>| ok.into_iter().flatten().collect::<Vec<Result<_, _>>>()))
                 // Option<Result<Vec<Result<,>,>>
         })
-        .collect::<Result<Vec<_>,_>>()
-        .map(|ok: Vec<_>| ok.into_iter().flatten().collect::<Vec<Result<_, _>>>())
     }
 
     /// Ensure that object is present in S3 bucket.
