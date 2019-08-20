@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::io::Read;
 use std::error::Error;
 use std::fmt;
-use ensure::{Absent, Present, Ensure, Meet};
+use ensure::{Absent, Present, Ensure, Meet, External, ExternalState};
 use ensure::CheckEnsureResult::*;
 use either::Either;
 use Either::*;
@@ -87,6 +87,8 @@ pub struct Object<'b> {
     key: String
 }
 
+impl External for Object<'_> {}
+
 impl<'b> Object<'b> {
     pub fn from_key(bucket: &Present<Bucket>, key: String) -> Object {
         Object {
@@ -113,6 +115,8 @@ impl<'b> Object<'b> {
 pub struct Bucket {
     name: String
 }
+
+impl External for Bucket {}
 
 impl Bucket {
     pub fn name(&self) -> &str {
@@ -182,6 +186,11 @@ pub struct TransferProgress {
     pub bytes_total: u64,
 }
 
+//TODO: Configurable timeouts
+//TODO: Max upload size info
+
+/// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
+/// S3 buckets and objects.
 pub struct S3 {
     client: S3Client,
     part_size: usize,
@@ -252,7 +261,7 @@ impl S3 {
         }
     }
 
-    pub fn list_prefix<'b, 's: 'b>(&'s self, bucket: &'b Present<Bucket>, prefix: String) -> impl Iterator<Item = Result<Present<Object<'b>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
+    pub fn list_objects<'b, 's: 'b>(&'s self, bucket: &'b Present<Bucket>, prefix: String) -> impl Iterator<Item = Result<Present<Object<'b>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         let client = &self.client;
         let pages = PaginationIter {
             request: ListObjectsV2Request {
@@ -301,6 +310,8 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
+    //TODO: object does not need to be Absent to update it's body
+    //TODO: Option<Options> to set content type, storage class ets
     pub fn put_object_body<'s, 'b>(&'s self, object: Absent<Object<'b>>, mut body: impl Read) -> Result<Present<Object<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
@@ -403,13 +414,17 @@ impl S3 {
         result
     }
 
-    /// Deletes list of objects (can be in different buckets).
-    ///
-    /// This does not fail if object does not exist.
-    pub fn delete_objects<'s, 'b>(&'s self, mut objects: Vec<Object<'b>>) -> Result<Vec<Absent<Object<'b>>>, S3SyncError> {
-        objects.sort_by_key(|o| o.bucket);
+    //TODO: This should return iterator since we can be working with unbounded number of objects
 
-        let groups = objects.into_iter().group_by(|o| o.bucket);
+    /// Deletes list of objects.
+    ///
+    /// Delete call does not fail if object does not exist and terefore this method can work with any
+    /// `ExternalState` of the object.
+    ///
+    /// Note that objects can live in different buckets. In this case they will be deleted bucket
+    /// by bucket.
+    pub fn delete_objects<'s, 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> Result<Vec<Absent<Object<'b>>>, S3SyncError> {
+        let groups = objects.into_iter().map(|o| o.invalidate_state()).group_by(|o| o.bucket);
 
         groups.into_iter().map(|(bucket, objects)| {
             objects.chunks(1000).into_iter().map(|chunk| {
@@ -471,6 +486,7 @@ impl S3 {
         }
     }
 
+    //TODO: object_absent?
 }
 
 #[cfg(feature = "test-s3")]
@@ -524,7 +540,8 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        s3.on_upload_progress(|p| {dbg!{p};});
+        //TODO: actually test state stuff
+        s3.on_upload_progress(|_p| ());
         s3.object_present(object, move || Ok(body)).ensure().or_failed_to("make object present");
     }
 
@@ -539,6 +556,16 @@ mod tests {
             Object::from_key(&bucket, test_key()),
         ];
 
+        s3.delete_objects(objects).or_failed_to("delete objects");
+    }
+
+    #[test]
+    fn test_delete_objects_from_list() {
+        let s3 = S3::new(Region::EuWest1, None);
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+
+        let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
         s3.delete_objects(objects).or_failed_to("delete objects");
     }
 }
