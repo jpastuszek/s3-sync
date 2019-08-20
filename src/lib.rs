@@ -483,7 +483,11 @@ impl S3 {
                             if let (Some(key), Some(error)) = (error.key, error.message) {
                                 if let Some(object) = objects.remove(&key) {
                                     failed_objects.push((object, S3SyncError::RusotoError(RusotoError::Validation(error))));
+                                } else {
+                                    return Err(S3SyncError::RusotoError(RusotoError::Validation("failed to delete S3 object which was not requested to be deleted".to_owned())))
                                 }
+                            } else {
+                                return Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors byt no key or message information".to_owned())))
                             }
                         }
                     }
@@ -600,6 +604,7 @@ mod tests {
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
+        //TODO: write better test
         let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
         s3.delete_objects(objects).or_failed_to("delete objects");
     }
