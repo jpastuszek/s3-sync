@@ -449,6 +449,7 @@ impl S3 {
                     let current_bucket_name = current_bucket_name.clone();
                     move |object| object.bucket.name == current_bucket_name})
                 .chunks(1000).into_iter().map(move |chunk| {
+                    // Index objects by key so we can pick those that failed later on
                     let mut objects = chunk
                         .into_iter()
                         .map(|o| (o.key.clone(), o))
@@ -493,8 +494,14 @@ impl S3 {
                         .chain(failed_objects.into_iter().map(|oe| Err(oe)))
                         .collect::<Vec<Result<_, _>>>())
                 })
-                .collect::<Result<Vec<Vec<Result<_, _>>>, _>>()
-                .map(|ok: Vec<_>| ok.into_iter().flatten().collect::<Vec<Result<_, _>>>()))
+                .try_fold(Vec::new(), |mut res, batch| {
+                    // Fail on first failed batch otherwise collect all deletion results in single
+                    // vector
+                    batch.map(|batch| {
+                        res.extend(batch);
+                        res
+                    })
+                }))
                 // Option<Result<Vec<Result<,>,>>
         })
     }
