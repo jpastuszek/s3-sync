@@ -12,6 +12,8 @@ use std::time::Duration;
 use std::io::Read;
 use std::error::Error;
 use std::fmt;
+use std::collections::HashMap;
+//use std::hash::{Hash, Hasher};
 use ensure::{Absent, Present, Ensure, Meet, External, ExternalState};
 use ensure::CheckEnsureResult::*;
 use either::Either;
@@ -81,11 +83,17 @@ impl From<std::io::Error> for S3SyncError {
 }
 
 /// Represents object in a bucket.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object<'b> {
     bucket: &'b Present<Bucket>,
     key: String
 }
+
+//impl<'b> Hash for Object<'b> {
+//    fn hash<H: Hasher>(&self, state: &mut H) {
+//        self.key.hash(state)
+//    }
+//}
 
 impl External for Object<'_> {}
 
@@ -423,52 +431,85 @@ impl S3 {
     ///
     /// Note that objects can live in different buckets. In this case they will be deleted bucket
     /// by bucket.
-    pub fn delete_objects<'s, 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> Result<Vec<Absent<Object<'b>>>, S3SyncError> {
-        let groups = objects.into_iter().map(|o| o.invalidate_state()).group_by(|o| o.bucket);
+    ///
+    /// Note that returned results are per batch of delte operations.
+    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) ->
+        Vec<
+            Result<
+                Vec<
+                    Result<
+                        Absent<Object<'b>>,
+                        (Object<'b>, S3SyncError)
+                    >
+                >,
+                S3SyncError
+            >
+        >
+        {
+        //Vec<Result<Vec<Absent<Object<'b>>>, Vec<(Object<'b>, S3SyncError)>>> {
+        //Vec<Result<Vec<Absent<Object<'b>>>, S3SyncError>> {
+        //impl Iterator<Item = Result<Vec<Absent<Object<'b>>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
 
-        groups.into_iter().map(|(bucket, objects)| {
-            objects.chunks(1000).into_iter().map(|chunk| {
-                let objects: Vec<ObjectIdentifier> = chunk.into_iter().map(|object| ObjectIdentifier {
-                    key: object.key.clone(),
-                    .. Default::default()
-                }).collect();
+        let mut objects = objects.into_iter().map(|o| o.invalidate_state()).peekable();
 
-                debug!("Deleting batch of {} objects from S3 bucket '{}'", objects.len(), bucket.name);
-                let res = self.client.delete_objects(DeleteObjectsRequest {
-                    bucket: bucket.name.clone(),
-                    delete: Delete {
-                        objects,
+        std::iter::from_fn(move || {
+            let current_bucket_name = if let Some(object) = objects.peek() {
+                object.bucket.name.clone()
+            } else {
+                return None
+            };
+
+            Some(objects
+                .peeking_take_while({
+                    let current_bucket_name = current_bucket_name.clone();
+                    move |object| object.bucket.name == current_bucket_name})
+                .chunks(1000).into_iter().map(move |chunk| {
+                    let mut objects = chunk
+                        .into_iter()
+                        .map(|o| (o.key.clone(), o))
+                        .collect::<HashMap<_, _>>();
+
+                    let object_ids: Vec<ObjectIdentifier> = objects.values().map(|object| ObjectIdentifier {
+                        key: object.key.clone(),
                         .. Default::default()
-                    }, .. Default::default()
-                }).with_timeout(Duration::from_secs(60)).sync()?;
-                trace!("Delete response: {:?}", res);
+                    }).collect();
 
-                if let Some(errors) = res.errors {
-                    for error in errors {
-                        error!("Error deleting S3 object '{}': {}",
-                            error.key.as_ref().map(|s| s.as_str()).unwrap_or("<None>"),
-                            error.message.as_ref().map(|s| s.as_str()).unwrap_or("<None>"));
+                    debug!("Deleting batch of {} objects from S3 bucket '{}'", objects.len(), current_bucket_name);
+                    let res = self.client.delete_objects(DeleteObjectsRequest {
+                        bucket: current_bucket_name.clone(),
+                        delete: Delete {
+                            objects: object_ids,
+                            .. Default::default()
+                        }, .. Default::default()
+                    }).with_timeout(Duration::from_secs(60)).sync()?;
+                    trace!("Delete response: {:?}", res);
+
+                    let mut failed_objects = Vec::new();
+
+                    if let Some(errors) = res.errors {
+                        for error in errors {
+                            error!("Error deleting S3 object '{}': {}",
+                                error.key.as_ref().map(|s| s.as_str()).unwrap_or("<None>"),
+                                error.message.as_ref().map(|s| s.as_str()).unwrap_or("<None>"));
+
+                            // Try the best to get failed objects out of OK objects along with error
+                            // message
+                            if let (Some(key), Some(error)) = (error.key, error.message) {
+                                if let Some(object) = objects.remove(&key) {
+                                    failed_objects.push((object, S3SyncError::RusotoError(RusotoError::Validation(error))));
+                                }
+                            }
+                        }
                     }
-                }
 
-                Ok(if let Some(deleted) = res.deleted {
-                    debug!("Deleted {} objects", deleted.len());
-                    deleted.into_iter().filter_map(|deleted| deleted.key.map(|key| Absent(Object::from_key(bucket, key)))).collect::<Vec<_>>()
-                } else {
-                    Vec::new()
+                    Ok(objects.into_iter().map(|(_k, o)| Ok(Absent(o)))
+                        .chain(failed_objects.into_iter().map(|oe| Err(oe)))
+                        .collect::<Vec<_>>())
                 })
-            })
-            .collect::<Result<Vec<_>, _>>() //TODO: refactor this?
-            .map(|chunks|
-                chunks.into_iter()
-                .flat_map(|chunk| chunk)
                 .collect::<Vec<_>>())
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|groups|
-            groups.into_iter()
-            .flat_map(|group| group)
-            .collect::<Vec<_>>())
+        .flatten()
+        .collect::<Vec<_>>()
     }
 
     /// Ensure that object is present in S3 bucket.
