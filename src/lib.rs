@@ -28,6 +28,7 @@ pub trait Captures2<'i> {}
 impl<'i, T> Captures2<'i> for T {}
 
 const DEFAULT_PART_SIZE: usize = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
+const DELETE_CHUNK_SIZE: usize = 1000; // how many objects to delete in single batch call
 
 #[derive(Debug)]
 pub enum S3SyncError {
@@ -452,17 +453,18 @@ impl S3 {
                 .peeking_take_while({
                     let current_bucket_name = current_bucket_name.clone();
                     move |object| object.bucket.name == current_bucket_name})
-                .chunks(1000).into_iter().map(move |chunk| {
+                .chunks(DELETE_CHUNK_SIZE).into_iter().map(move |chunk| {
                     // Index objects by key so we can pick those that failed later on
-                    let mut objects = chunk
-                        .into_iter()
-                        .map(|o| (o.key.clone(), o))
-                        .collect::<HashMap<_, _>>();
+                    let mut objects = HashMap::with_capacity(DELETE_CHUNK_SIZE);
+                    let mut object_ids = Vec::with_capacity(DELETE_CHUNK_SIZE);
 
-                    let object_ids: Vec<ObjectIdentifier> = objects.values().map(|object| ObjectIdentifier {
-                        key: object.key.clone(),
-                        .. Default::default()
-                    }).collect();
+                    for object in chunk {
+                        object_ids.push(ObjectIdentifier {
+                            key: object.key.clone(),
+                            .. Default::default()
+                        });
+                        objects.insert(object.key.clone(), object);
+                    }
 
                     debug!("Deleting batch of {} objects from S3 bucket '{}'", objects.len(), current_bucket_name);
                     let res = self.client.delete_objects(DeleteObjectsRequest {
@@ -488,17 +490,39 @@ impl S3 {
                                 if let Some(object) = objects.remove(&key) {
                                     failed_objects.push((object, S3SyncError::RusotoError(RusotoError::Validation(error))));
                                 } else {
-                                    return Err(S3SyncError::RusotoError(RusotoError::Validation("failed to delete S3 object which was not requested to be deleted".to_owned())))
+                                    return Err(S3SyncError::RusotoError(RusotoError::Validation("S3 reported object failed to delete that was not requested to be deleted".to_owned())))
                                 }
                             } else {
-                                return Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors byt no key or message information".to_owned())))
+                                return Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors but no key or message information".to_owned())))
                             }
                         }
                     }
 
+                    let ok_objects =
+                    if let Some(deleted) = res.deleted {
+                        debug!("Deleted {} objects", deleted.len());
+                        deleted.iter().map(|deleted| {
+                            if let Some(key) = &deleted.key {
+                                if let Some(object) = objects.remove(key) {
+                                    Ok(Absent(object))
+                                } else {
+                                    Err(S3SyncError::RusotoError(RusotoError::Validation("S3 reported object delted that was not requested to be deleted".to_owned())))
+                                }
+                            } else {
+                                Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors but no key or message information".to_owned())))
+                            }
+                        }).collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        Vec::new()
+                    };
+
+                    if !objects.is_empty() {
+                        return Err(S3SyncError::RusotoError(RusotoError::Validation("some S3 objects were not deleted or failed failed to be delete".to_owned())))
+                    }
+
                     // Result<Vec<Result<,>,>
-                    Ok(objects.into_iter()
-                        .map(|(_k, o)| Ok(Absent(o)))
+                    Ok(ok_objects.into_iter()
+                        .map(|o| Ok(o))
                         .chain(failed_objects.into_iter().map(|oe| Err(oe)))
                         .collect::<Vec<Result<_, _>>>())
                 })
@@ -537,6 +561,7 @@ impl S3 {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use std::io::Cursor;
 
     fn s3_test_bucket() -> Bucket {
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set").into()
@@ -575,8 +600,6 @@ mod tests {
 
     #[test]
     fn test_object_present_progress() {
-        use std::io::Cursor;
-
         let mut s3 = S3::new(Region::EuWest1, None);
         let body = Cursor::new(b"hello world".to_vec());
 
@@ -589,17 +612,39 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_objects() {
+    fn test_delete_objects_given() {
         let s3 = S3::new(Region::EuWest1, None);
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+
         let objects = vec![
-            Object::from_key(&bucket, "s3-sync-test/foo".to_owned()),
-            Object::from_key(&bucket, test_key()),
-            Object::from_key(&bucket, test_key()),
+            Object::from_key(&bucket, "s3-sync-test/bar-1".to_owned()),
+            Object::from_key(&bucket, "s3-sync-test/bar-2".to_owned()),
         ];
 
-        s3.delete_objects(objects).or_failed_to("delete objects");
+        for object in objects.clone() {
+            s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
+        }
+
+        let mut ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+
+        // one batch
+        assert_eq!(ops.len(), 1);
+        // two objects in the batch
+        assert_eq!(ops[0].len(), 2);
+
+        // API returns out of order
+        ops[0].sort_by_key(|o| o.as_ref().map(|o| o.key.clone()).unwrap_or("NONE".to_owned()));
+
+        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+                        assert_eq!(name, &s3_test_bucket().name);
+                        assert_eq!(key, "s3-sync-test/bar-1")
+        });
+
+        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+                        assert_eq!(name, &s3_test_bucket().name);
+                        assert_eq!(key, "s3-sync-test/bar-2")
+        });
     }
 
     #[test]
@@ -608,8 +653,35 @@ mod tests {
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
-        //TODO: write better test
+        let objects = vec![
+            Object::from_key(&bucket, "s3-sync-test/baz-1".to_owned()),
+            Object::from_key(&bucket, "s3-sync-test/baz-2".to_owned()),
+            Object::from_key(&bucket, "s3-sync-test/bax".to_owned()),
+        ];
+
+        for object in objects {
+            s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
+        }
+
         let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
-        s3.delete_objects(objects).or_failed_to("delete objects");
+        let mut ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+
+        // one batch
+        assert_eq!(ops.len(), 1);
+        // two objects in the batch
+        assert_eq!(ops[0].len(), 2);
+
+        // API returns out of order
+        ops[0].sort_by_key(|o| o.as_ref().map(|o| o.key.clone()).unwrap_or("NONE".to_owned()));
+
+        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+                        assert_eq!(name, &s3_test_bucket().name);
+                        assert_eq!(key, "s3-sync-test/baz-1")
+        });
+
+        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+                        assert_eq!(name, &s3_test_bucket().name);
+                        assert_eq!(key, "s3-sync-test/baz-2")
+        });
     }
 }
