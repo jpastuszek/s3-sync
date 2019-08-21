@@ -307,7 +307,7 @@ impl S3 {
         })
     }
 
-    pub fn get_object_body<'s, 'b>(&'s self, bucket: String, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
+    pub fn get_object<'s, 'b>(&'s self, bucket: String, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         self.client.get_object(GetObjectRequest {
             bucket,
@@ -318,11 +318,15 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
-    //TODO: object does not need to be Absent to update it's body
     //TODO: Option<Options> to set content type, storage class ets
-    pub fn put_object_body<'s, 'b>(&'s self, object: Absent<Object<'b>>, mut body: impl Read) -> Result<Present<Object<'b>>, S3SyncError> {
+    pub fn put_object<'s, 'b>(&'s self, object: impl ExternalState<Object<'b>>, mut body: impl Read) -> Result<Present<Object<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
+
+        // does not matter if object is present or absent
+        let object = object.invalidate_state();
+        let bucket_name = object.bucket.name.clone();
+        let object_key = object.key.clone();
 
         let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
             bucket: object.bucket.name.clone(),
@@ -361,8 +365,8 @@ impl S3 {
                 debug!("Uploading part {} ({} bytes)", part_number, bytes);
                 let result = self.client.upload_part(UploadPartRequest {
                     body: Some(body),
-                    bucket: object.bucket.name.clone(),
-                    key: object.key.clone(),
+                    bucket: bucket_name.clone(),
+                    key: object_key.clone(),
                     part_number: part_number as i64,
                     upload_id: upload_id.clone(),
                     .. Default::default()
@@ -389,8 +393,8 @@ impl S3 {
 
             debug!("Multipart upload {:?} complete", upload_id);
             self.client.complete_multipart_upload(CompleteMultipartUploadRequest {
-                bucket: object.bucket.name.clone(),
-                key: object.key.clone(),
+                bucket: bucket_name.clone(),
+                key: object_key.clone(),
                 upload_id: upload_id.clone(),
                 multipart_upload: Some(CompletedMultipartUpload {
                     parts: Some(completed_parts)
@@ -402,14 +406,14 @@ impl S3 {
             progress.status = TransferStatus::Done;
             self.on_upload_progress.as_ref().map(|c| c(&progress));
 
-            Ok(Present(object.0.clone()))
+            Ok(Present(object))
         }();
 
         if let Err(err) = &result {
             error!("Aborting multipart upload {:?} due to error: {}", upload_id, Problem::from_error_message(err));
             self.client.abort_multipart_upload(AbortMultipartUploadRequest {
-                bucket: object.bucket.name.clone(),
-                key: object.key.clone(),
+                bucket: bucket_name,
+                key: object_key,
                 upload_id,
                 .. Default::default()
             }).with_timeout(Duration::from_secs(300)).sync().ok_or_log_warn();
@@ -519,7 +523,7 @@ impl S3 {
             Ok(match self.check_object_exists(object)? {
                 Left(present) => Met(present),
                 Right(absent) => EnsureAction(move || {
-                    self.put_object_body(absent, body()?)
+                    self.put_object(absent, body()?)
                 })
             })
         }
