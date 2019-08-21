@@ -427,18 +427,20 @@ impl S3 {
         result
     }
 
-    /// Deletes list of objects.
+    /// Deletes list of objects in streaming fashion using bulk delete API.
     ///
-    /// Delete call does not fail if object does not exist and therefore this method can work with any
-    /// `ExternalState` of the object.
+    /// Note that if returned iterator is not completely consumed not all items from the list may
+    /// be processed.
     ///
-    /// Note that objects can live in different buckets. In this case they will be deleted bucket
-    /// by bucket.
+    /// Delete call does not fail if object does not exist and therefore this method can work with
+    /// `Present`, `Absent` or just `Object` values.
     ///
-    /// Each returned items represent batch delete call to S3.
-    /// Item is of `Err` variant for call that failed entirely.
-    /// When `Ok` variant is returned the batch delete call succeeded but each individual object could have
-    /// failed to be deleted.
+    /// Objects can live in different buckets but for best performance it is
+    /// recommended to order the list by bucket so that biggest batches can be crated.
+    ///
+    /// Each returned item represent batch delete call to S3 API.
+    /// Successful batch call will return `Ok` variant containing vector of results for each
+    /// individual object delete operation as provided by S3.
     pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl ExternalState<Object<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<Object<'b>>, (Object<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         objects
             .into_iter()
