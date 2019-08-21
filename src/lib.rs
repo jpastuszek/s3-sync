@@ -195,8 +195,6 @@ pub struct TransferProgress {
     pub bytes_total: u64,
 }
 
-//TODO: Configurable timeouts
-
 /// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
 /// S3 buckets and objects.
 pub struct S3 {
@@ -265,6 +263,7 @@ impl S3 {
         ret
     }
 
+    /// Checks if given bucket exists.
     pub fn check_bucket_exists(&self, bucket: Bucket) -> Result<Either<Present<Bucket>, Absent<Bucket>>, S3SyncError> {
         use rusoto_s3::HeadBucketRequest;
         use rusoto_s3::HeadBucketError;
@@ -284,6 +283,7 @@ impl S3 {
         }
     }
 
+    /// Checks if given object exists.
     pub fn check_object_exists<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
         use rusoto_s3::HeadObjectRequest;
         use rusoto_s3::HeadObjectError;
@@ -304,6 +304,7 @@ impl S3 {
         }
     }
 
+    /// Provides iterator of objects in existing bucket that have key of given prefix.
     pub fn list_objects<'b, 's: 'b>(&'s self, bucket: &'b Present<Bucket>, prefix: String) -> impl Iterator<Item = Result<Present<Object<'b>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         let client = &self.client;
         let pages = PaginationIter {
@@ -342,11 +343,12 @@ impl S3 {
         })
     }
 
-    pub fn get_object<'s, 'b>(&'s self, bucket: String, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
+    /// Gets object body.
+    pub fn get_object<'s, 'b>(&'s self, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         self.client.get_object(GetObjectRequest {
-            bucket,
-            key: object.0.key.to_owned(),
+            bucket: object.bucket.name.clone(),
+            key: object.key.clone(),
             .. Default::default()
         }).with_timeout(self.data_timeout).sync()
         .map_err(Into::into)
@@ -354,6 +356,13 @@ impl S3 {
     }
 
     //TODO: Option<Options> to set content type, storage class ets
+    /// Puts object with given body using multipart API.
+    ///
+    /// If given existing object it will be overwritten.
+    ///
+    /// Use `.max_upload_size()` to find out how many bytes the body can have at maximum.
+    /// Increase `part_size` to be able to upload more date (`max_upload_size = part_number *
+    /// 10_000`).
     pub fn put_object<'s, 'b>(&'s self, object: impl ExternalState<Object<'b>>, mut body: impl Read) -> Result<Present<Object<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
@@ -552,10 +561,12 @@ impl S3 {
             })
     }
 
-    /// Ensure that object is present in S3 bucket.
+    /// Returns `Ensure` object that can be used to ensure that object is present in the S3 bucket.
     ///
-    /// It will call body function to obtain Read object from which the data will be uploaded to S3
+    /// It will call body function to obtain `Read` object from which the data will be uploaded to S3
     /// if object does not already exist there.
+    ///
+    /// Note that there can be a race condition between check if object exists and upload.
     pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(object)? {
@@ -585,6 +596,8 @@ mod tests {
         use std::time::SystemTime;
         format!("s3-sync-test/foo-{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros())
     }
+
+    //TODO: test get_object
 
     #[test]
     fn test_object_present() {
