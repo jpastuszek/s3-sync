@@ -29,6 +29,7 @@ impl<'i, T> Captures2<'i> for T {}
 
 const DEFAULT_PART_SIZE: usize = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
 const DELETE_BATCH_SIZE: usize = 1000; // how many objects to delete in single batch call
+const MAX_MULTIPART_PARTS: usize = 10_000; // as defined by S3 API limit
 
 #[derive(Debug)]
 pub enum S3SyncError {
@@ -196,7 +197,6 @@ pub struct TransferProgress {
 }
 
 //TODO: Configurable timeouts
-//TODO: Max upload size info
 
 /// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
 /// S3 buckets and objects.
@@ -207,7 +207,7 @@ pub struct S3 {
 }
 
 impl S3 {
-    /// Crate new Rusoto based S3 client.
+    /// Creates new Rusoto based high level S3 client.
     pub fn new(region: Region, part_size: impl Into<Option<usize>>) -> S3 {
         S3 {
             client: S3Client::new(region),
@@ -216,13 +216,17 @@ impl S3 {
         }
     }
 
-    /// Maximum size of the multipart upload part.
+    /// Gets maximum size of the multipart upload part.
     ///
     /// Useful to set up other I/O buffers accordingly.
     pub fn part_size(&self) -> usize {
         self.part_size
     }
 
+    /// Returns maximum size of data in bytes that S3 object can be put with.
+    pub fn max_upload_size(&self) -> usize {
+        self.part_size * MAX_MULTIPART_PARTS
+    }
 
     /// Set callback on body upload progress.
     pub fn on_upload_progress(&mut self, callback: impl Fn(&TransferProgress) + 'static) -> Option<Box<dyn Fn(&TransferProgress)>> {
