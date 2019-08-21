@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::io::Read;
 use std::error::Error;
 use std::fmt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 //use std::hash::{Hash, Hasher};
 use ensure::{Absent, Present, Ensure, Meet, External, ExternalState};
 use ensure::CheckEnsureResult::*;
@@ -454,32 +454,38 @@ impl S3 {
                     let current_bucket_name = current_bucket_name.clone();
                     move |object| object.bucket.name == current_bucket_name})
                 .chunks(DELETE_CHUNK_SIZE).into_iter().map(move |chunk| {
-                    // Index objects by key so we can pick those that failed later on
-                    let mut objects = HashMap::with_capacity(DELETE_CHUNK_SIZE);
-                    let mut object_ids = Vec::with_capacity(DELETE_CHUNK_SIZE);
-
-                    for object in chunk {
-                        object_ids.push(ObjectIdentifier {
-                            key: object.key.clone(),
-                            .. Default::default()
-                        });
-                        objects.insert(object.key.clone(), object);
-                    }
+                    let objects = chunk.collect::<Vec<_>>();
 
                     debug!("Deleting batch of {} objects from S3 bucket '{}'", objects.len(), current_bucket_name);
                     let res = self.client.delete_objects(DeleteObjectsRequest {
                         bucket: current_bucket_name.clone(),
                         delete: Delete {
-                            objects: object_ids,
+                            objects: objects.iter().map(|object| ObjectIdentifier {
+                                key: object.key.clone(),
+                                .. Default::default()
+                            }).collect::<Vec<_>>(),
                             .. Default::default()
                         }, .. Default::default()
                     }).with_timeout(Duration::from_secs(60)).sync()?;
                     trace!("Delete response: {:?}", res);
 
-                    let mut failed_objects = Vec::new();
+                    let ok_objects =
+                    if let Some(deleted) = res.deleted {
+                        debug!("Deleted {} objects", deleted.len());
+                        deleted.into_iter().map(|deleted| {
+                            if let Some(key) = deleted.key {
+                                Ok(key)
+                            } else {
+                                Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors but no key or message information".to_owned())))
+                            }
+                        }).collect::<Result<HashSet<_>, _>>()?
+                    } else {
+                        Default::default()
+                    };
 
+                    let mut failed_objects =
                     if let Some(errors) = res.errors {
-                        for error in errors {
+                        errors.into_iter().map(|error| {
                             error!("Error deleting S3 object '{}': {}",
                                 error.key.as_ref().map(|s| s.as_str()).unwrap_or("<None>"),
                                 error.message.as_ref().map(|s| s.as_str()).unwrap_or("<None>"));
@@ -487,48 +493,26 @@ impl S3 {
                             // Try the best to get failed objects out of OK objects along with error
                             // message
                             if let (Some(key), Some(error)) = (error.key, error.message) {
-                                if let Some(object) = objects.remove(&key) {
-                                    failed_objects.push((object, S3SyncError::RusotoError(RusotoError::Validation(error))));
-                                } else {
-                                    return Err(S3SyncError::RusotoError(RusotoError::Validation("S3 reported object failed to delete that was not requested to be deleted".to_owned())))
-                                }
-                            } else {
-                                return Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors but no key or message information".to_owned())))
-                            }
-                        }
-                    }
-
-                    let ok_objects =
-                    if let Some(deleted) = res.deleted {
-                        debug!("Deleted {} objects", deleted.len());
-                        deleted.iter().map(|deleted| {
-                            if let Some(key) = &deleted.key {
-                                if let Some(object) = objects.remove(key) {
-                                    Ok(Absent(object))
-                                } else {
-                                    Err(S3SyncError::RusotoError(RusotoError::Validation("S3 reported object delted that was not requested to be deleted".to_owned())))
-                                }
+                                Ok((key, S3SyncError::RusotoError(RusotoError::Validation(error))))
                             } else {
                                 Err(S3SyncError::RusotoError(RusotoError::Validation("got S3 delete object errors but no key or message information".to_owned())))
                             }
-                        }).collect::<Result<Vec<_>, _>>()?
+                        }).collect::<Result<HashMap<_, _>, _>>()?
                     } else {
-                        Vec::new()
+                        Default::default()
                     };
 
-                    if !objects.is_empty() {
-                        return Err(S3SyncError::RusotoError(RusotoError::Validation("some S3 objects were not deleted or failed failed to be delete".to_owned())))
-                    }
-
-                    // Result<Vec<Result<,>,>
-                    Ok(ok_objects.into_iter()
-                        .map(|o| Ok(o))
-                        .chain(failed_objects.into_iter().map(|oe| Err(oe)))
-                        .collect::<Vec<Result<_, _>>>())
+                    Ok(objects.into_iter().map(|o| {
+                        if ok_objects.contains(&o.key) {
+                            Ok(Absent(o))
+                        } else if let Some(err) = failed_objects.remove(&o.key) {
+                            Err((o, err))
+                        } else {
+                            Err((o, S3SyncError::RusotoError(RusotoError::Validation("S3 did not report this object as deleted or failed to be deleted".to_owned()))))
+                        }
+                    }).collect::<Vec<_>>())
                 })
                 .try_fold(Vec::new(), |mut res, batch| {
-                    // Fail on first failed batch otherwise collect all deletion results in single
-                    // vector
                     batch.map(|batch| {
                         res.extend(batch);
                         res
@@ -626,15 +610,12 @@ mod tests {
             s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
         }
 
-        let mut ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+        let ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
 
         // one batch
         assert_eq!(ops.len(), 1);
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
-
-        // API returns out of order
-        ops[0].sort_by_key(|o| o.as_ref().map(|o| o.key.clone()).unwrap_or("NONE".to_owned()));
 
         assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
@@ -664,15 +645,12 @@ mod tests {
         }
 
         let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
-        let mut ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+        let ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
 
         // one batch
         assert_eq!(ops.len(), 1);
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
-
-        // API returns out of order
-        ops[0].sort_by_key(|o| o.as_ref().map(|o| o.key.clone()).unwrap_or("NONE".to_owned()));
 
         assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
