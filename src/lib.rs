@@ -27,7 +27,6 @@ impl<'i, T> Captures1<'i> for T {}
 pub trait Captures2<'i> {}
 impl<'i, T> Captures2<'i> for T {}
 
-const DEFAULT_PART_SIZE: usize = 10 * 1024 * 1024; // note that max parts is 10k = 100_000 MiB
 const DELETE_BATCH_SIZE: usize = 1000; // how many objects to delete in single batch call
 const MAX_MULTIPART_PARTS: usize = 10_000; // as defined by S3 API limit
 
@@ -202,17 +201,48 @@ pub struct TransferProgress {
 /// S3 buckets and objects.
 pub struct S3 {
     client: S3Client,
-    part_size: usize,
     on_upload_progress: Option<Box<dyn Fn(&TransferProgress)>>,
+    /// Size of multipart upload part.
+    part_size: usize,
+    /// Timeout for non data related operations.
+    timeout: Duration,
+    /// Timeout for data upload/download operations.
+    data_timeout: Duration,
+}
+
+pub struct Settings {
+    /// Size of multipart upload part.
+    pub part_size: usize,
+    /// Timeout for non data related operations.
+    pub timeout: Duration,
+    /// Timeout for data upload/download operations.
+    pub data_timeout: Duration,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            part_size: 10 * 1024 * 1024, // note that max part count is 10k so we can upload up to 100_000 MiB
+            timeout: Duration::from_secs(10),
+            data_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 impl S3 {
-    /// Creates new Rusoto based high level S3 client.
-    pub fn new(region: Region, part_size: impl Into<Option<usize>>) -> S3 {
+    /// Creates new Rusoto based high level S3 client with default settings.
+    pub fn new(region: Region) -> S3 {
+        Self::new_with_settings(region, Settings::default())
+    }
+
+    /// Creates new Rusoto based high level S3 client with given settings.
+    pub fn new_with_settings(region: Region, settings: Settings) -> S3 {
         S3 {
             client: S3Client::new(region),
-            part_size: part_size.into().unwrap_or(DEFAULT_PART_SIZE),
             on_upload_progress: None,
+            part_size: settings.part_size,
+            timeout: settings.timeout,
+            data_timeout: settings.data_timeout,
         }
     }
 
@@ -243,7 +273,7 @@ impl S3 {
         let res = self.client.head_bucket(HeadBucketRequest {
             bucket: bucket.name.clone(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(10)).sync();
+        }).with_timeout(self.timeout).sync();
         trace!("Head bucket response: {:?}", res);
 
         match res {
@@ -263,7 +293,7 @@ impl S3 {
             bucket: object.bucket.name.clone(),
             key: object.key.clone(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(10)).sync();
+        }).with_timeout(self.timeout).sync();
         trace!("Head response: {:?}", res);
 
         match res {
@@ -289,7 +319,7 @@ impl S3 {
                 response.contents.as_ref().and_then(|objects| objects.last().and_then(|last| last.key.as_ref().map(|r| r.clone())))
             },
             fetch: move |request: ListObjectsV2Request| {
-                client.list_objects_v2(request).with_timeout(Duration::from_secs(10)).sync().map_err(Into::into)
+                client.list_objects_v2(request).with_timeout(self.timeout).sync().map_err(Into::into)
             },
             done: false
         };
@@ -318,7 +348,7 @@ impl S3 {
             bucket,
             key: object.0.key.to_owned(),
             .. Default::default()
-        }).with_timeout(Duration::from_secs(300)).sync()
+        }).with_timeout(self.data_timeout).sync()
         .map_err(Into::into)
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
@@ -340,7 +370,7 @@ impl S3 {
             //TODO: content_type, storage_clase etc.
             .. Default::default()
         })
-        .with_timeout(Duration::from_secs(300)).sync()?
+        .with_timeout(self.timeout).sync()?
         .upload_id.expect("no upload ID");
 
         debug!("Started multipart upload {:?}", upload_id);
@@ -375,7 +405,7 @@ impl S3 {
                     part_number: part_number as i64,
                     upload_id: upload_id.clone(),
                     .. Default::default()
-                }).with_timeout(Duration::from_secs(300)).sync()?;
+                }).with_timeout(self.data_timeout).sync()?;
 
                 completed_parts.push(CompletedPart {
                     e_tag: result.e_tag,
@@ -405,7 +435,7 @@ impl S3 {
                     parts: Some(completed_parts)
                 }),
                 .. Default::default()
-            }).with_timeout(Duration::from_secs(300)).sync()?;
+            }).with_timeout(self.timeout).sync()?;
 
             // Notify it is done
             progress.status = TransferStatus::Done;
@@ -421,7 +451,7 @@ impl S3 {
                 key: object_key,
                 upload_id,
                 .. Default::default()
-            }).with_timeout(Duration::from_secs(300)).sync().ok_or_log_warn();
+            }).with_timeout(self.timeout).sync().ok_or_log_warn();
 
             // Notify it is has failed
             progress.status = TransferStatus::Failed;
@@ -474,7 +504,7 @@ impl S3 {
                         }).collect::<Vec<_>>(),
                         .. Default::default()
                     }, .. Default::default()
-                }).with_timeout(Duration::from_secs(60)).sync()?;
+                }).with_timeout(self.timeout).sync()?;
                 trace!("Delete response: {:?}", res);
 
                 let ok_objects =
@@ -560,7 +590,7 @@ mod tests {
     fn test_object_present() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::EuWest1, None);
+        let s3 = S3::new(Region::EuWest1);
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -573,7 +603,7 @@ mod tests {
     fn test_object_present_empty_read() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::EuWest1, None);
+        let s3 = S3::new(Region::EuWest1);
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -584,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_object_present_progress() {
-        let mut s3 = S3::new(Region::EuWest1, None);
+        let mut s3 = S3::new(Region::EuWest1);
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -597,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_given() {
-        let s3 = S3::new(Region::EuWest1, None);
+        let s3 = S3::new(Region::EuWest1);
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
@@ -610,7 +640,7 @@ mod tests {
             s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
         }
 
-        let ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+        let ops = s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>();
 
         // one batch
         assert_eq!(ops.len(), 1);
@@ -630,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_from_list() {
-        let s3 = S3::new(Region::EuWest1, None);
+        let s3 = S3::new(Region::EuWest1);
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
@@ -645,7 +675,7 @@ mod tests {
         }
 
         let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
-        let ops = dbg![s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>()];
+        let ops = s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>();
 
         // one batch
         assert_eq!(ops.len(), 1);
