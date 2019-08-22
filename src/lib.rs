@@ -13,7 +13,6 @@ use std::io::Read;
 use std::error::Error;
 use std::fmt;
 use std::collections::{HashMap, HashSet};
-//use std::hash::{Hash, Hasher};
 use ensure::{Absent, Present, Ensure, Meet, External, ExternalState};
 use ensure::CheckEnsureResult::*;
 use either::Either;
@@ -89,12 +88,6 @@ pub struct Object<'b> {
     bucket: &'b Present<Bucket>,
     key: String
 }
-
-//impl<'b> Hash for Object<'b> {
-//    fn hash<H: Hasher>(&self, state: &mut H) {
-//        self.key.hash(state)
-//    }
-//}
 
 impl External for Object<'_> {}
 
@@ -193,6 +186,27 @@ pub struct TransferProgress {
     pub bytes: u64,
     /// Total number of bytes transferred.
     pub bytes_total: u64,
+}
+
+/// Meta information about object body.
+#[derive(Debug)]
+pub struct ObjectBodyMeta {
+    /// A standard MIME type describing the format of the object data.
+    content_type: String,
+    /// Specifies presentational information for the object.
+    content_disposition: Option<String>,
+    /// The language the content is in.
+    content_language: Option<String>,
+}
+
+impl Default for ObjectBodyMeta {
+    fn default() -> ObjectBodyMeta {
+        ObjectBodyMeta {
+            content_type: "application/octet-stream".to_owned(),
+            content_disposition: None,
+            content_language: None,
+        }
+    }
 }
 
 /// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
@@ -355,7 +369,6 @@ impl S3 {
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
     }
 
-    //TODO: Option<Options> to set content type, storage class ets
     /// Puts object with given body using multipart API.
     ///
     /// If given existing object it will be overwritten.
@@ -363,7 +376,7 @@ impl S3 {
     /// Use `.max_upload_size()` to find out how many bytes the body can have at maximum.
     /// Increase `part_size` to be able to upload more date (`max_upload_size = part_number *
     /// 10_000`).
-    pub fn put_object<'s, 'b>(&'s self, object: impl ExternalState<Object<'b>>, mut body: impl Read) -> Result<Present<Object<'b>>, S3SyncError> {
+    pub fn put_object<'s, 'b>(&'s self, object: impl ExternalState<Object<'b>>, mut body: impl Read, meta: ObjectBodyMeta) -> Result<Present<Object<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
 
@@ -375,8 +388,9 @@ impl S3 {
         let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
             bucket: object.bucket.name.clone(),
             key: object.key.clone(),
-            content_type: Some("application/octet-stream".to_owned()),
-            //TODO: content_type, storage_clase etc.
+            content_type: Some(meta.content_type),
+            content_disposition: meta.content_disposition,
+            content_language: meta.content_language,
             .. Default::default()
         })
         .with_timeout(self.timeout).sync()?
@@ -564,15 +578,16 @@ impl S3 {
     /// Returns `Ensure` object that can be used to ensure that object is present in the S3 bucket.
     ///
     /// It will call body function to obtain `Read` object from which the data will be uploaded to S3
-    /// if object does not already exist there.
+    /// and its meta data if object does not already exist there.
     ///
     /// Note that there can be a race condition between check if object exists and upload.
-    pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<R, std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(object)? {
                 Left(present) => Met(present),
                 Right(absent) => EnsureAction(move || {
-                    self.put_object(absent, body()?)
+                    let (body, meta) = body()?;
+                    self.put_object(absent, body, meta)
                 })
             })
         }
@@ -609,7 +624,7 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        s3.object_present(object, move || Ok(body)).ensure().or_failed_to("make object present");
+        s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
     }
 
     #[test]
@@ -622,7 +637,7 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        assert_matches!(s3.object_present(object, move || Ok(body)).ensure(), Err(S3SyncError::NoBodyError));
+        assert_matches!(s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure(), Err(S3SyncError::NoBodyError));
     }
 
     #[test]
@@ -635,7 +650,7 @@ mod tests {
 
         //TODO: actually test state stuff
         s3.on_upload_progress(|_p| ());
-        s3.object_present(object, move || Ok(body)).ensure().or_failed_to("make object present");
+        s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
     }
 
     #[test]
@@ -650,7 +665,7 @@ mod tests {
         ];
 
         for object in objects.clone() {
-            s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
+            s3.put_object(object, Cursor::new(b"foo bar".to_vec()), ObjectBodyMeta::default()).unwrap();
         }
 
         let ops = s3.delete_objects(objects).or_failed_to("delete objects").collect::<Vec<_>>();
@@ -684,7 +699,7 @@ mod tests {
         ];
 
         for object in objects {
-            s3.put_object(object, Cursor::new(b"foo bar".to_vec())).unwrap();
+            s3.put_object(object, Cursor::new(b"foo bar".to_vec()), ObjectBodyMeta::default()).unwrap();
         }
 
         let objects = s3.list_objects(&bucket, "s3-sync-test/baz".to_owned()).or_failed_to("get list of objects");
