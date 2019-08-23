@@ -1,5 +1,5 @@
 use rusoto_s3::S3Client;
-use rusoto_s3::{DeleteObjectsRequest, Delete, ObjectIdentifier};
+use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier};
 pub use rusoto_core::region::Region;
 use rusoto_core::RusotoError;
 use rusoto_s3::S3 as S3Trait;
@@ -19,6 +19,8 @@ use either::Either;
 use Either::*;
 use problem::prelude::*;
 use itertools::Itertools;
+
+//TODO: replace '{}' with {:?} as it properly escapes names
 
 pub trait Captures1<'i> {}
 impl<'i, T> Captures1<'i> for T {}
@@ -489,6 +491,27 @@ impl S3 {
         result
     }
 
+    /// Deletes single object.
+    ///
+    /// Delete call does not fail if object does not exist and therefore this method can work with
+    /// `Present`, `Absent` or just `Object` values.
+    ///
+    /// To delete many objects it is better performance wise to use `.delete_objects()` witch
+    /// uses bulk delete API.
+    pub fn delete_object<'b, 's: 'b>(&'s self, object: impl ExternalState<Object<'b>>) -> Result<Absent<Object<'b>>, S3SyncError> {
+        let object = object.invalidate_state();
+
+        debug!("Deleting object {:?} from S3 bucket {:?}", object.key, object.bucket.name);
+        let res = self.client.delete_object(DeleteObjectRequest {
+            bucket: object.bucket.name.clone(),
+            key: object.key.clone(),
+            .. Default::default()
+        }).with_timeout(self.timeout).sync()?;
+        trace!("Delete response: {:?}", res);
+
+        Ok(Absent(object))
+    }
+
     /// Deletes list of objects in streaming fashion using bulk delete API.
     ///
     /// Note that if returned iterator is not completely consumed not all items from the list may
@@ -598,7 +621,19 @@ impl S3 {
         }
     }
 
-    //TODO: object_absent?
+    /// Returns `Ensure` object that can be used to ensure that object is absent in the S3 bucket.
+    ///
+    /// Note that there can be a race condition between check if object exists and delete operation.
+    pub fn object_absent<'b, 's: 'b>(&'s self, object: Object<'b>) -> impl Ensure<Absent<Object<'b>>, EnsureAction = impl Meet<Met = Absent<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+        move || {
+            Ok(match self.check_object_exists(object)? {
+                Right(absent) => Met(absent),
+                Left(present) => EnsureAction(move || {
+                    self.delete_object(present)
+                })
+            })
+        }
+    }
 }
 
 #[cfg(feature = "test-s3")]
@@ -629,7 +664,26 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+        let object = s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+
+        assert!(s3.check_object_exists(object.invalidate_state()).unwrap().is_left());
+    }
+
+    #[test]
+    fn test_object_absent() {
+        use std::io::Cursor;
+
+        let s3 = S3::new(Region::EuWest1);
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        let object = Object::from_key(&bucket, test_key());
+
+        let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap().invalidate_state();
+
+        let object = s3.object_absent(object).ensure().or_failed_to("make object absent");
+
+        assert!(s3.check_object_exists(object.invalidate_state()).unwrap().is_right());
     }
 
     #[test]
