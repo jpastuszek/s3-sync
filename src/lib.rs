@@ -658,7 +658,7 @@ mod tests {
     fn test_object_present() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::EuWest1);
+        let s3 = S3::new(Region::default());
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -673,7 +673,7 @@ mod tests {
     fn test_object_absent() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::EuWest1);
+        let s3 = S3::new(Region::default());
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -690,7 +690,7 @@ mod tests {
     fn test_object_present_empty_read() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::EuWest1);
+        let s3 = S3::new(Region::default());
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_object_present_progress() {
-        let mut s3 = S3::new(Region::EuWest1);
+        let mut s3 = S3::new(Region::default());
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_given() {
-        let s3 = S3::new(Region::EuWest1);
+        let s3 = S3::new(Region::default());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_from_list() {
-        let s3 = S3::new(Region::EuWest1);
+        let s3 = S3::new(Region::default());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
