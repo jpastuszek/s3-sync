@@ -13,6 +13,7 @@ use std::io::Read;
 use std::error::Error;
 use std::fmt;
 use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
 use ensure::{Absent, Present, Ensure, Meet, External, ExternalState};
 use ensure::CheckEnsureResult::*;
 use either::Either;
@@ -167,11 +168,11 @@ pub enum TransferStatus {
     /// Initialization successful.
     Init,
     /// Transfer is ongoing.
-    Progress,
+    Progress(TransferStats),
     /// Transfer successfully complete.
-    Done,
+    Done(TransferStats),
     /// There was an error.
-    Failed,
+    Failed(String),
 }
 
 impl Default for TransferStatus {
@@ -180,11 +181,40 @@ impl Default for TransferStatus {
     }
 }
 
+impl TransferStatus {
+    fn update(&mut self, stats: TransferStats) {
+        match self {
+            TransferStatus::Init => {
+                *self = TransferStatus::Progress(stats);
+            }
+            TransferStatus::Progress(ref mut s) => {
+                s.buffers += stats.buffers;
+                s.bytes = stats.bytes;
+                s.bytes_total += stats.bytes_total;
+            },
+            _ => panic!("TransferStats in bad state for .done(): {:?}", self),
+        }
+    }
+
+    fn done(self) -> Self {
+        match self {
+            TransferStatus::Progress(stats) => TransferStatus::Done(stats),
+            _ => panic!("TransferStats in bad state for .done(): {:?}", self),
+        }
+    }
+
+    fn failed(self, err: String) -> Self {
+        match self {
+            TransferStatus::Init |
+            TransferStatus::Progress(_) => TransferStatus::Failed(err),
+            _ => panic!("TransferStats in bad state for .failed(): {:?}", self),
+        }
+    }
+}
+
 /// Information about transfer progress.
 #[derive(Debug, Default)]
-pub struct TransferProgress {
-    /// Status of the transfer.
-    pub status: TransferStatus,
+pub struct TransferStats {
     /// Number of buffers or parts transferred.
     pub buffers: u16,
     /// Number of bytes transferred since last progress.
@@ -218,7 +248,7 @@ impl Default for ObjectBodyMeta {
 /// S3 buckets and objects.
 pub struct S3 {
     client: S3Client,
-    on_upload_progress: Option<Box<dyn Fn(&TransferProgress)>>,
+    on_upload_progress: Option<RefCell<Box<dyn FnMut(&TransferStatus)>>>,
     /// Size of multipart upload part.
     part_size: usize,
     /// Timeout for non data related operations.
@@ -276,10 +306,16 @@ impl S3 {
     }
 
     /// Set callback on body upload progress.
-    pub fn on_upload_progress(&mut self, callback: impl Fn(&TransferProgress) + 'static) -> Option<Box<dyn Fn(&TransferProgress)>> {
+    pub fn on_upload_progress(&mut self, callback: impl FnMut(&TransferStatus) + 'static) -> Option<Box<dyn FnMut(&TransferStatus)>> {
         let ret = self.on_upload_progress.take();
-        self.on_upload_progress = Some(Box::new(callback));
-        ret
+        self.on_upload_progress = Some(RefCell::new(Box::new(callback)));
+        ret.map(|c| c.into_inner())
+    }
+
+    fn notify_upload_progress(&self, status: &TransferStatus) {
+        self.on_upload_progress.as_ref().map(|c| {
+            c.try_borrow_mut().expect("S3 upload_progress closure already borrowed mutable").as_mut()(status);
+        });
     }
 
     /// Checks if given bucket exists.
@@ -404,10 +440,10 @@ impl S3 {
         debug!("Started multipart upload {:?}", upload_id);
 
         let mut completed_parts = Vec::new();
-        let mut progress = TransferProgress::default();
+        let mut progress = TransferStatus::default();
 
         // Notify progress init
-        self.on_upload_progress.as_ref().map(|c| c(&progress));
+        self.notify_upload_progress(&progress);
 
         let result = || -> Result<_, S3SyncError> {
             let body = &mut body;
@@ -440,13 +476,14 @@ impl S3 {
                     part_number: Some(part_number as i64),
                 });
 
-                progress.status = TransferStatus::Progress;
-                progress.buffers += 1;
-                progress.bytes = bytes as u64;
-                progress.bytes_total += bytes as u64;
+                progress.update(TransferStats {
+                    buffers: 1,
+                    bytes: bytes as u64,
+                    bytes_total: bytes as u64,
+                });
 
                 // Notify with progress
-                self.on_upload_progress.as_ref().map(|c| c(&progress));
+                self.notify_upload_progress(&progress);
             }
 
             // No parts uploaded
@@ -465,15 +502,12 @@ impl S3 {
                 .. Default::default()
             }).with_timeout(self.timeout).sync()?;
 
-            // Notify it is done
-            progress.status = TransferStatus::Done;
-            self.on_upload_progress.as_ref().map(|c| c(&progress));
-
             Ok(Present(object))
         }();
 
         if let Err(err) = &result {
-            error!("Aborting multipart upload {:?} due to error: {}", upload_id, Problem::from_error_message(err));
+            let err = Problem::from_error_message(err).to_string();
+            error!("Aborting multipart upload {:?} due to error: {}", upload_id, err);
             self.client.abort_multipart_upload(AbortMultipartUploadRequest {
                 bucket: bucket_name,
                 key: object_key,
@@ -482,8 +516,10 @@ impl S3 {
             }).with_timeout(self.timeout).sync().ok_or_log_warn();
 
             // Notify it is has failed
-            progress.status = TransferStatus::Failed;
-            self.on_upload_progress.as_ref().map(|c| c(&progress));
+            self.notify_upload_progress(&progress.failed(err));
+        } else {
+            // Notify it is done
+            self.notify_upload_progress(&progress.done());
         }
 
         result
@@ -705,8 +741,15 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        //TODO: actually test state stuff
-        s3.on_upload_progress(|_p| ());
+        let asserts: Vec<Box<dyn Fn(&TransferStatus)>> = vec![
+            Box::new(|t| assert_matches!(t, TransferStatus::Init)),
+            Box::new(|t| assert_matches!(t, TransferStatus::Progress(_))),
+            Box::new(|t| assert_matches!(t, TransferStatus::Done(_))),
+        ];
+
+        let mut asserts = asserts.into_iter();
+
+        s3.on_upload_progress(move |t| asserts.next().unwrap()(t));
         s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
     }
 
