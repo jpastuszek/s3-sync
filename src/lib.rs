@@ -399,7 +399,7 @@ impl S3 {
     }
 
     /// Gets object body.
-    pub fn get_object<'s, 'b>(&'s self, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
+    pub fn get_body<'s, 'b>(&'s self, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         self.client.get_object(GetObjectRequest {
             bucket: object.bucket.name.clone(),
@@ -686,7 +686,24 @@ mod tests {
         format!("s3-sync-test/foo-{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros())
     }
 
-    //TODO: test get_object
+    #[test]
+    fn test_get_body() {
+        use std::io::Cursor;
+
+        let s3 = S3::new(Region::default());
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        let object = Object::from_key(&bucket, test_key());
+
+        let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
+
+        let mut body = Vec::new();
+
+        s3.get_body(&object).unwrap().into_blocking_read().read_to_end(&mut body).unwrap();
+
+        assert_eq!(&body, b"hello world");
+    }
 
     #[test]
     fn test_object_present() {
