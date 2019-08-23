@@ -161,12 +161,16 @@ impl<RQ, RS, SSA, GSA, FF, E> Iterator for PaginationIter<RQ, RS, SSA, GSA, FF, 
     }
 }
 
-
+/// Information about status of the ongoing transfer.
 #[derive(Debug)]
 pub enum TransferStatus {
+    /// Initialization successful.
     Init,
+    /// Transfer is ongoing.
     Progress,
+    /// Transfer successfully complete.
     Done,
+    /// There was an error.
     Failed,
 }
 
@@ -176,6 +180,7 @@ impl Default for TransferStatus {
     }
 }
 
+/// Information about transfer progress.
 #[derive(Debug, Default)]
 pub struct TransferProgress {
     /// Status of the transfer.
