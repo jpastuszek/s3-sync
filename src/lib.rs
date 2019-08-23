@@ -449,8 +449,12 @@ impl S3 {
             let body = &mut body;
 
             for part_number in 1u16.. {
-                //TODO: streaming bufs
-                let mut buf = Vec::with_capacity(self.part_size);
+                // Note that S3 does not support chunked uploads of single part so we need to send
+                // full part at once. Best thing to do here would be to use Bytes directly to avoid
+                // allocation per part upload...
+                // Need to allocate one byte more to avoid re-allocation as read_to_end needs to
+                // have place for storage before it gets EoF.
+                let mut buf = Vec::with_capacity(self.part_size + 1);
                 let bytes = body.take(self.part_size as u64).read_to_end(&mut buf)?;
 
                 // Don't create 0 byte parts on EoF
@@ -458,12 +462,9 @@ impl S3 {
                     break
                 }
 
-                //let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
-                let body = ByteStream::from(buf);
-
                 debug!("Uploading part {} ({} bytes)", part_number, bytes);
                 let result = self.client.upload_part(UploadPartRequest {
-                    body: Some(body),
+                    body: Some(ByteStream::from(buf)),
                     bucket: bucket_name.clone(),
                     key: object_key.clone(),
                     part_number: part_number as i64,
