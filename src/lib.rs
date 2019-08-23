@@ -20,6 +20,11 @@ use either::Either;
 use Either::*;
 use problem::prelude::*;
 use itertools::Itertools;
+use futures::sync::mpsc::channel;
+use futures::sink::Sink;
+use futures::future::Future;
+use futures::stream::Stream;
+use bytes::Bytes;
 
 pub trait Captures1<'i> {}
 impl<'i, T> Captures1<'i> for T {}
@@ -449,27 +454,38 @@ impl S3 {
             let body = &mut body;
 
             for part_number in 1u16.. {
-                //TODO: streaming bufs
-                let mut buf = Vec::with_capacity(self.part_size);
-                let bytes = body.take(self.part_size as u64).read_to_end(&mut buf)?;
+                let (buf_sender, buf_receiver) = channel(1);
 
-                // Don't create 0 byte parts on EoF
-                if bytes == 0 {
-                    break
-                }
+                let body_stream = ByteStream::new(buf_receiver.map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "impossible")));
 
-                //let body = ByteStream::new(stream::once(Ok(Bytes::from(buf))));
-                let body = ByteStream::from(buf);
-
-                debug!("Uploading part {} ({} bytes)", part_number, bytes);
                 let result = self.client.upload_part(UploadPartRequest {
-                    body: Some(body),
+                    body: Some(body_stream),
                     bucket: bucket_name.clone(),
                     key: object_key.clone(),
                     part_number: part_number as i64,
                     upload_id: upload_id.clone(),
                     .. Default::default()
-                }).with_timeout(self.data_timeout).sync()?;
+                }).with_timeout(self.data_timeout);
+
+                let buf_size = self.part_size / 10;
+                let mut bytes = 0;
+
+                debug!("Uploading part {}", part_number);
+                loop {
+                    let mut buf = Vec::with_capacity(buf_size + 1 as usize);
+                    let buf_bytes = body.take(buf_size as u64).read_to_end(&mut buf)?;
+
+                    if buf_bytes == 0 {
+                        break
+                    }
+
+                    bytes += buf_bytes;
+
+                    buf_sender.clone().send(Bytes::from(buf)).wait().ok();
+                }
+                drop(buf_sender);
+
+                let result = result.sync()?;
 
                 completed_parts.push(CompletedPart {
                     e_tag: result.e_tag,
@@ -643,7 +659,7 @@ impl S3 {
     /// and its meta data if object does not already exist there.
     ///
     /// Note that there can be a race condition between check if object exists and upload.
-    pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_present<'b, 's: 'b, R: Read, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(object)? {
                 Left(present) => Met(present),
