@@ -20,8 +20,6 @@ use Either::*;
 use problem::prelude::*;
 use itertools::Itertools;
 
-//TODO: replace '{}' with {:?} as it properly escapes names
-
 pub trait Captures1<'i> {}
 impl<'i, T> Captures1<'i> for T {}
 
@@ -545,7 +543,7 @@ impl S3 {
                         .collect::<Vec<_>>()))
             })
             .map(move |(current_bucket_name, objects): (_, Vec<_>)| {
-                debug!("Deleting batch of {} objects from S3 bucket '{}'", objects.len(), current_bucket_name);
+                debug!("Deleting batch of {} objects from S3 bucket {:?}", objects.len(), current_bucket_name);
                 let res = self.client.delete_objects(DeleteObjectsRequest {
                     bucket: current_bucket_name.clone(),
                     delete: Delete {
@@ -575,7 +573,7 @@ impl S3 {
                 let mut failed_objects =
                 if let Some(errors) = res.errors {
                     errors.into_iter().map(|error| {
-                        error!("Error deleting S3 object '{}': {}",
+                        error!("Error deleting S3 object {:?}: {}",
                             error.key.as_ref().map(|s| s.as_str()).unwrap_or("<None>"),
                             error.message.as_ref().map(|s| s.as_str()).unwrap_or("<None>"));
 
