@@ -1,3 +1,13 @@
+/*!
+Yet another high level S3 client.
+
+This client wraps Rusoto S3 and provides following features:
+* check if bucket or object exists,
+* list objects that match prefix as iterator that handles pagination for you,
+* put objects via multipart API to support large objects and follow progress via callback,
+* delete single or any number of object via bulk delete API,
+* deffer execution using `ensure` crate for putting and deleting objects.
+!*/
 use rusoto_s3::S3Client;
 use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier};
 pub use rusoto_core::region::Region;
@@ -135,7 +145,7 @@ impl From<String> for Bucket {
     }
 }
 
-pub struct PaginationIter<RQ, RS, SSA, GSA, FF, E> where RQ: Clone, SSA: Fn(&mut RQ, String), GSA: Fn(&RS) -> Option<String>, FF: Fn(RQ) -> Result<RS, E> {
+struct PaginationIter<RQ, RS, SSA, GSA, FF, E> where RQ: Clone, SSA: Fn(&mut RQ, String), GSA: Fn(&RS) -> Option<String>, FF: Fn(RQ) -> Result<RS, E> {
     request: RQ,
     // function that returns request parametrised to fetch next page
     set_start_after: SSA,
@@ -227,11 +237,11 @@ pub struct TransferStats {
 #[derive(Debug)]
 pub struct ObjectBodyMeta {
     /// A standard MIME type describing the format of the object data.
-    content_type: String,
+    pub content_type: String,
     /// Specifies presentational information for the object.
-    content_disposition: Option<String>,
+    pub content_disposition: Option<String>,
     /// The language the content is in.
-    content_language: Option<String>,
+    pub content_language: Option<String>,
 }
 
 impl Default for ObjectBodyMeta {
