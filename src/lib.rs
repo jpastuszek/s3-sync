@@ -1,5 +1,5 @@
 /*!
-Yet another high level S3 client.
+High level synchronous S3 client.
 
 This client wraps Rusoto S3 and provides the following features:
 * check if bucket or object exists,
@@ -28,7 +28,7 @@ let body = Cursor::new(b"hello world".to_vec());
 let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
 
 let mut body = Vec::new();
-s3.get_body(&object).unwrap().into_blocking_read().read_to_end(&mut body).unwrap();
+s3.get_body(&object).expect("object body").read_to_end(&mut body).unwrap();
 
 assert_eq!(&body, b"hello world");
 ```
@@ -40,7 +40,6 @@ use rusoto_core::RusotoError;
 use rusoto_s3::S3 as S3Trait;
 use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
 use rusoto_s3::Object as S3Object;
-use rusoto_s3::StreamingBody;
 use log::{trace, debug, error};
 use itertools::unfold;
 use std::time::Duration;
@@ -128,6 +127,7 @@ pub struct Object<'b> {
 impl External for Object<'_> {}
 
 impl<'b> Object<'b> {
+    /// Creates `Object` from present `Bucket` and given key `String`.
     pub fn from_key(bucket: &Present<Bucket>, key: String) -> Object {
         Object {
             bucket,
@@ -139,10 +139,12 @@ impl<'b> Object<'b> {
         Object::from_key(bucket, object.key.expect("S3 object has no key!"))
     }
 
+    /// Gets objects bucket.
     pub fn bucket(&self) -> &Present<Bucket> {
         self.bucket
     }
 
+    /// Gets object key.
     pub fn key(&self) -> &str {
         &self.key
     }
@@ -157,6 +159,7 @@ pub struct Bucket {
 impl External for Bucket {}
 
 impl Bucket {
+    /// Gets bucket name.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -311,6 +314,8 @@ impl Default for Settings {
     }
 }
 
+//TODO: with_on_upload_porgres
+
 impl S3 {
     /// Creates new Rusoto based high level S3 client with default settings.
     pub fn new(region: Region) -> S3 {
@@ -434,7 +439,7 @@ impl S3 {
     }
 
     /// Gets object body.
-    pub fn get_body<'s, 'b>(&'s self, object: &'_ Present<Object<'b>>) -> Result<StreamingBody, S3SyncError> {
+    pub fn get_body<'s, 'b>(&'s self, object: &'_ Present<Object<'b>>) -> Result<impl Read, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         self.client.get_object(GetObjectRequest {
             bucket: object.bucket.name.clone(),
@@ -443,6 +448,7 @@ impl S3 {
         }).with_timeout(self.data_timeout).sync()
         .map_err(Into::into)
         .and_then(|output| output.body.ok_or(S3SyncError::NoBodyError))
+        .map(|body| body.into_blocking_read())
     }
 
     /// Puts object with given body using multipart API.
@@ -735,7 +741,7 @@ mod tests {
 
         let mut body = Vec::new();
 
-        s3.get_body(&object).unwrap().into_blocking_read().read_to_end(&mut body).unwrap();
+        s3.get_body(&object).unwrap().read_to_end(&mut body).unwrap();
 
         assert_eq!(&body, b"hello world");
     }
