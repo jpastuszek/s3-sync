@@ -1,4 +1,5 @@
 [![Latest Version]][crates.io] [![Documentation]][docs.rs] ![License]
+
 High level synchronous S3 Rust client library.
 
 This client wraps Rusoto S3 and provides the following features:
@@ -33,8 +34,8 @@ s3.get_body(&object).expect("object body").read_to_end(&mut body).unwrap();
 assert_eq!(&body, b"hello world");
 ```
 
-[crates.io]: https://crates.io/crates/multiline
-[Latest Version]: https://img.shields.io/crates/v/multiline.svg
-[Documentation]: https://docs.rs/multiline/badge.svg
-[docs.rs]: https://docs.rs/multiline
-[License]: https://img.shields.io/crates/l/multiline.svg
+[crates.io]: https://crates.io/crates/s3-sync
+[Latest Version]: https://img.shields.io/crates/v/s3-sync.svg
+[Documentation]: https://docs.rs/s3-sync/badge.svg
+[docs.rs]: https://docs.rs/s3-sync
+[License]: https://img.shields.io/crates/l/s3-sync.svg
