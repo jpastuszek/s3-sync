@@ -12,7 +12,7 @@ Example usage
 =============
 
 ```rust
-use s3_sync::{S3, Region, ObjectBodyMeta, Object};
+use s3_sync::{S3, Region, ObjectBodyMeta, Object, Bucket};
 use std::io::Cursor;
 use std::io::Read;
 
@@ -21,7 +21,7 @@ let test_key = "foobar.test";
 
 let s3 = S3::new(Region::default());
 
-let bucket = s3.check_bucket_exists(test_bucket.into()).expect("check if bucket exists").left().expect("bucket does not exist");
+let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
 let object = Object::from_key(&bucket, test_key.to_owned());
 
 let body = Cursor::new(b"hello world".to_vec());
@@ -159,17 +159,16 @@ pub struct Bucket {
 impl External for Bucket {}
 
 impl Bucket {
-    /// Gets bucket name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl From<String> for Bucket {
-    fn from(name: String) -> Bucket {
+    /// Creates `Bucket` from bucket name `String`.
+    pub fn from_name(name: String) -> Bucket {
         Bucket {
             name
         }
+    }
+
+    /// Gets bucket name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -726,7 +725,7 @@ mod tests {
     use std::io::Cursor;
 
     fn s3_test_bucket() -> Bucket {
-        std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set").into()
+        Bucket::from_name(std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set"))
     }
 
     fn test_key() -> String {
