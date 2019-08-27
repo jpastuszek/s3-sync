@@ -314,8 +314,6 @@ impl Default for Settings {
     }
 }
 
-//TODO: with_on_upload_porgres
-
 impl S3 {
     /// Creates new Rusoto based high level S3 client with default settings.
     pub fn new(region: Region) -> S3 {
@@ -350,6 +348,15 @@ impl S3 {
         let ret = self.on_upload_progress.take();
         self.on_upload_progress = Some(RefCell::new(Box::new(callback)));
         ret.map(|c| c.into_inner())
+    }
+
+    /// Calls `f` with `S3` client that has `on_upload_progress` set to `callback` and restores
+    /// callback to previous state on return.
+    pub fn with_on_upload_progress<O>(&mut self, callback: impl FnMut(&TransferStatus) + 'static, f: impl FnOnce(&mut Self) -> O) -> O {
+        let old = self.on_upload_progress(callback);
+        let ret = f(self);
+        old.map(|callback| self.on_upload_progress(callback));
+        ret
     }
 
     fn notify_upload_progress(&self, status: &TransferStatus) {
@@ -807,8 +814,9 @@ mod tests {
 
         let mut asserts = asserts.into_iter();
 
-        s3.on_upload_progress(move |t| asserts.next().unwrap()(t));
-        s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+        s3.with_on_upload_progress(move |t| asserts.next().unwrap()(t), |s3| {
+            s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+        });
     }
 
     #[test]
