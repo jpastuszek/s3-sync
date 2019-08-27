@@ -1,12 +1,37 @@
 /*!
 Yet another high level S3 client.
 
-This client wraps Rusoto S3 and provides following features:
+This client wraps Rusoto S3 and provides the following features:
 * check if bucket or object exists,
-* list objects that match prefix as iterator that handles pagination for you,
-* put objects via multipart API to support large objects and follow progress via callback,
-* delete single or any number of object via bulk delete API,
+* list objects that match prefix as iterator that handles pagination transparently,
+* put large objects via multipart API and follow progress via callback,
+* delete single or any number of objects via bulk delete API,
 * deffer execution using `ensure` crate for putting and deleting objects.
+
+Example usage
+=============
+
+```rust
+use s3_sync::{S3, Region, ObjectBodyMeta, Object};
+use std::io::Cursor;
+use std::io::Read;
+
+let test_bucket = std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set");
+let test_key = "foobar.test";
+
+let s3 = S3::new(Region::default());
+
+let bucket = s3.check_bucket_exists(test_bucket.into()).expect("check if bucket exists").left().expect("bucket does not exist");
+let object = Object::from_key(&bucket, test_key.to_owned());
+
+let body = Cursor::new(b"hello world".to_vec());
+let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
+
+let mut body = Vec::new();
+s3.get_body(&object).unwrap().into_blocking_read().read_to_end(&mut body).unwrap();
+
+assert_eq!(&body, b"hello world");
+```
 !*/
 use rusoto_s3::S3Client;
 use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier};
@@ -681,7 +706,6 @@ impl S3 {
     }
 }
 
-#[cfg(feature = "test-s3")]
 #[cfg(test)]
 mod tests {
     use super::*;

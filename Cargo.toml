@@ -4,9 +4,6 @@ version = "0.1.0"
 authors = ["Jakub Pastuszek <jpastuszek@protonmail.com>"]
 edition = "2018"
 
-[features]
-test-s3 = []
-
 [dependencies]
 rusoto_s3 = "0.40.0"
 rusoto_core = "0.40.0"
