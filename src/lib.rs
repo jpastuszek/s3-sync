@@ -281,6 +281,15 @@ impl Default for ObjectBodyMeta {
     }
 }
 
+/// Method used for checking if given object exists
+#[derive(Debug)]
+pub enum CheckObjectImpl {
+    /// Required `GetObject` permission
+    Head,
+    /// Required `ListBucket` permission
+    List,
+}
+
 /// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
 /// S3 buckets and objects.
 pub struct S3 {
@@ -385,7 +394,19 @@ impl S3 {
     }
 
     /// Checks if given object exists.
-    pub fn check_object_exists<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
+    ///
+    /// * `implementaiton` - select implementation of ths function
+    pub fn check_object_exists<'s, 'b>(&'s self, object: Object<'b>, implementation: CheckObjectImpl) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
+        match implementation {
+            CheckObjectImpl::List => self.check_object_exists_list(object),
+            CheckObjectImpl::Head => self.check_object_exists_head(object),
+        }
+    }
+
+    /// Checks if given object exists by issuing HeadObject request.
+    ///
+    /// Requires `GetObject` premission.
+    pub fn check_object_exists_head<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
         use rusoto_s3::HeadObjectRequest;
         use rusoto_s3::HeadObjectError;
         use rusoto_core::request::BufferedHttpResponse;
@@ -402,6 +423,27 @@ impl S3 {
             Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => Ok(Right(Absent(object))),
             Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(object))),
             Err(err) => Err(err.into())
+        }
+    }
+
+    /// Checks if given object exists by listing objects.
+    ///
+    /// Requires `ListBucket` permission.
+    pub fn check_object_exists_list<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
+        let request = ListObjectsV2Request {
+            bucket: object.bucket.name().to_owned(),
+            prefix: Some(object.key.clone()),
+            max_keys: Some(1),
+            .. Default::default()
+        };
+
+        let res = self.client.list_objects_v2(request).with_timeout(self.timeout).sync()?;
+        let first_key = res.contents.
+            and_then(|list| list.into_iter().next())
+            .and_then(|obj| obj.key);
+        match first_key {
+            Some(key) if key == object.key => Ok(Left(Present(object))),
+            _ => Ok(Right(Absent(object)))
         }
     }
 
@@ -691,9 +733,9 @@ impl S3 {
     /// and its meta data if object does not already exist there.
     ///
     /// Note that there can be a race condition between check if object exists and upload.
-    pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>(&'s self, object: Object<'b>, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>(&'s self, object: Object<'b>, check_impl: CheckObjectImpl, body: F) -> impl Ensure<Present<Object<'b>>, EnsureAction = impl Meet<Met = Present<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
-            Ok(match self.check_object_exists(object)? {
+            Ok(match self.check_object_exists(object, check_impl)? {
                 Left(present) => Met(present),
                 Right(absent) => EnsureAction(move || {
                     let (body, meta) = body()?;
@@ -706,9 +748,9 @@ impl S3 {
     /// Returns `Ensure` object that can be used to ensure that object is absent in the S3 bucket.
     ///
     /// Note that there can be a race condition between check if object exists and delete operation.
-    pub fn object_absent<'b, 's: 'b>(&'s self, object: Object<'b>) -> impl Ensure<Absent<Object<'b>>, EnsureAction = impl Meet<Met = Absent<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_absent<'b, 's: 'b>(&'s self, object: Object<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<Object<'b>>, EnsureAction = impl Meet<Met = Absent<Object<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
-            Ok(match self.check_object_exists(object)? {
+            Ok(match self.check_object_exists(object, check_impl)? {
                 Right(absent) => Met(absent),
                 Left(present) => EnsureAction(move || {
                     self.delete_object(present)
@@ -762,9 +804,9 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        let object = s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+        let object = s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
 
-        assert!(s3.check_object_exists(object.invalidate_state()).unwrap().is_left());
+        assert!(s3.check_object_exists(object.invalidate_state(), CheckObjectImpl::Head).unwrap().is_left());
     }
 
     #[test]
@@ -779,9 +821,9 @@ mod tests {
 
         let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap().invalidate_state();
 
-        let object = s3.object_absent(object).ensure().or_failed_to("make object absent");
+        let object = s3.object_absent(object, CheckObjectImpl::Head).ensure().or_failed_to("make object absent");
 
-        assert!(s3.check_object_exists(object.invalidate_state()).unwrap().is_right());
+        assert!(s3.check_object_exists(object.invalidate_state(), CheckObjectImpl::List).unwrap().is_right());
     }
 
     #[test]
@@ -794,7 +836,7 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
         let object = Object::from_key(&bucket, test_key());
 
-        assert_matches!(s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure(), Err(S3SyncError::NoBodyError));
+        assert_matches!(s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure(), Err(S3SyncError::NoBodyError));
     }
 
     #[test]
@@ -814,7 +856,7 @@ mod tests {
         let mut asserts = asserts.into_iter();
 
         s3.with_on_upload_progress(move |t| asserts.next().unwrap()(t), |s3| {
-            s3.object_present(object, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+            s3.object_present(object, CheckObjectImpl::Head, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
         });
     }
 
