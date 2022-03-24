@@ -55,6 +55,10 @@ use Either::*;
 use problem::prelude::*;
 use itertools::Itertools;
 
+// re-export return type crates
+pub use ensure;
+pub use either;
+
 pub trait Captures1<'i> {}
 impl<'i, T> Captures1<'i> for T {}
 
