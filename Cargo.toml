@@ -12,8 +12,8 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
-rusoto_s3 = "0.40.0"
-rusoto_core = "0.40.0"
+rusoto_s3 = "0.42.0"
+rusoto_core = "0.42.0"
 log = "0.4.8"
 itertools = "0.8.0"
 ensure = "0.3.0"
