@@ -37,6 +37,7 @@ use rusoto_s3::S3Client;
 use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier};
 pub use rusoto_core::region::Region;
 use rusoto_core::RusotoError;
+use rusoto_core::request::BufferedHttpResponse;
 use rusoto_s3::S3 as S3Trait;
 use rusoto_s3::{ListObjectsV2Request, ListObjectsV2Output};
 use rusoto_s3::Object as S3Object;
@@ -84,7 +85,15 @@ impl fmt::Display for S3SyncError {
                 RusotoError::Credentials(err) => write!(f, "AWS error was encountered with credentials: {}", err),
                 RusotoError::Validation(err) => write!(f, "AWS validation error occurred: {}", err),
                 RusotoError::ParseError(err) => write!(f, "AWS error occurred parsing the response payload: {}", err),
-                RusotoError::Unknown(err) => write!(f, "unknown AWS error occurred: {:?}", err),
+                RusotoError::Unknown(err @ BufferedHttpResponse { status, .. }) => if let Some(reason) = status.canonical_reason() {
+                    if err.body.is_empty() {
+                        write!(f, "AWS HTTP error occurred: {}", reason)
+                    } else {
+                        write!(f, "AWS HTTP error occurred: {}: {}", reason, err.body_as_str())
+                    }
+                } else {
+                    write!(f, "unknown AWS HTTP error occurred: {:?}", err)
+                }
             },
             S3SyncError::IoError(_) => write!(f, "local I/O error"),
             S3SyncError::NoBodyError => write!(f, "expected body but found none"),
@@ -381,7 +390,6 @@ impl S3 {
     pub fn check_bucket_exists(&self, bucket: Bucket) -> Result<Either<Present<Bucket>, Absent<Bucket>>, S3SyncError> {
         use rusoto_s3::HeadBucketRequest;
         use rusoto_s3::HeadBucketError;
-        use rusoto_core::request::BufferedHttpResponse;
 
         let res = self.client.head_bucket(HeadBucketRequest {
             bucket: bucket.name.clone(),
@@ -413,7 +421,6 @@ impl S3 {
     pub fn check_object_exists_head<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
         use rusoto_s3::HeadObjectRequest;
         use rusoto_s3::HeadObjectError;
-        use rusoto_core::request::BufferedHttpResponse;
 
         let res = self.client.head_object(HeadObjectRequest {
             bucket: object.bucket.name.clone(),
