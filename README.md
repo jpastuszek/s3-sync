@@ -3,14 +3,14 @@
 High level synchronous S3 Rust client library.
 
 This client wraps Rusoto S3 and provides the following features:
+
 * check if bucket or object exists,
 * list objects that match prefix as iterator that handles pagination transparently,
-* put large objects via multipart API and follow progress via callback,
-* delete single or any number of objects via bulk delete API,
+* put large objects via multipart API and follow progress via a callback,
+* delete single or multiple objects via bulk delete API,
 * deffer execution using `ensure` crate for putting and deleting objects.
 
-Example usage
-=============
+# Example usage
 
 ```rust
 use s3_sync::{S3, Region, ObjectBodyMeta, Object, Bucket};
