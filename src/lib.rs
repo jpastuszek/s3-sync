@@ -133,8 +133,13 @@ impl From<std::io::Error> for S3SyncError {
 /// Represents object in a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object<'b> {
-    bucket: &'b Present<Bucket>,
-    key: String
+    pub bucket: &'b Present<Bucket>,
+    pub key: String,
+    pub size: Option<i64>,
+    pub e_tag: Option<String>,
+    pub last_modified: Option<String>,
+    pub owner_id: Option<String>,
+    pub owner_name: Option<String>,
 }
 
 impl External for Object<'_> {}
@@ -144,12 +149,26 @@ impl<'b> Object<'b> {
     pub fn from_key(bucket: &Present<Bucket>, key: String) -> Object {
         Object {
             bucket,
-            key
+            key,
+            e_tag: None,
+            last_modified: None,
+            size: None,
+            owner_id: None,
+            owner_name: None,
         }
     }
 
     fn from_s3_object(bucket: &Present<Bucket>, object: S3Object) -> Object {
-        Object::from_key(bucket, object.key.expect("S3 object has no key!"))
+        let mut owner = object.owner;
+        Object {
+            bucket,
+            key: object.key.expect("S3 object has no key!"),
+            e_tag: object.e_tag,
+            last_modified: object.last_modified,
+            size: object.size,
+            owner_id: owner.as_mut().and_then(|o| o.id.take()),
+            owner_name: owner.as_mut().and_then(|o| o.display_name.take()),
+        }
     }
 
     /// Gets objects bucket.
@@ -160,6 +179,41 @@ impl<'b> Object<'b> {
     /// Gets object key.
     pub fn key(&self) -> &str {
         &self.key
+    }
+
+    /// Gets object size.
+    ///
+    /// Panic: If object was created without setting size.
+    pub fn unwrap_size(&self) -> i64 {
+        self.size.expect("S3 object without size")
+    }
+
+    /// Gets object ETag.
+    ///
+    /// Panic: If object was created without setting ETag.
+    pub fn unwrap_e_tag(&self) -> &str {
+        self.e_tag.as_deref().expect("S3 object without e_tag")
+    }
+
+    /// Gets object last modified time.
+    ///
+    /// Panic: If object was created without setting last modified.
+    pub fn unwrap_last_modified(&self) -> &str {
+        self.last_modified.as_deref().expect("S3 object without last_modified")
+    }
+
+    /// Gets object object owner ID.
+    ///
+    /// Panic: If object was created without setting owner ID.
+    pub fn unwrap_owner_id(&self) -> &str {
+        self.owner_id.as_deref().expect("S3 object without owner_id")
+    }
+
+    /// Gets object object owner display name.
+    ///
+    /// Panic: If object was created without setting owner display name.
+    pub fn unwrap_owner_name(&self) -> &str {
+        self.owner_name.as_deref().expect("S3 object without owner_name")
     }
 }
 
@@ -316,6 +370,17 @@ pub struct S3 {
     data_timeout: Duration,
 }
 
+impl fmt::Debug for S3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3")
+         .field("part_size", &self.part_size)
+         .field("timeout", &self.timeout)
+         .field("data_timeout", &self.data_timeout)
+         .finish()
+    }
+}
+
+#[derive(Debug)]
 pub struct Settings {
     /// Size of multipart upload part.
     pub part_size: usize,
