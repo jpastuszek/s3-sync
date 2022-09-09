@@ -1,6 +1,6 @@
 [package]
 name = "s3-sync"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Jakub Pastuszek <jpastuszek@protonmail.com>"]
 description = "High level synchronous S3 client"
 repository = "https://git.sr.ht/~jpastuszek/s3-sync"
