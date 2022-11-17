@@ -940,7 +940,7 @@ mod tests {
 
         let mut body = Vec::new();
 
-        s3.get_body(object).unwrap().read_to_end(&mut body).unwrap();
+        s3.get_body(&object).unwrap().read_to_end(&mut body).unwrap();
 
         assert_eq!(&body, b"hello world");
     }
