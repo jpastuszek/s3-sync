@@ -998,12 +998,12 @@ mod tests {
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
 
-        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key, .. })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/bar-1")
         });
 
-        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key, .. })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/bar-2")
         });
@@ -1033,12 +1033,12 @@ mod tests {
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
 
-        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][0], Ok(Absent(Object { bucket: Present(Bucket { name }), key, .. })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/baz-1")
         });
 
-        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][1], Ok(Absent(Object { bucket: Present(Bucket { name }), key, .. })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/baz-2")
         });
