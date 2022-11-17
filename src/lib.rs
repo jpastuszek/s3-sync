@@ -19,7 +19,7 @@ use std::io::Read;
 let test_bucket = std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set");
 let test_key = "foobar.test";
 
-let s3 = S3::new(Region::default());
+let s3 = S3::default();
 
 let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
 let object = Object::from_key(&bucket, test_key.to_owned());
@@ -420,14 +420,31 @@ impl Default for Settings {
     }
 }
 
+impl Default for S3 {
+    fn default() -> S3 {
+        S3::new(None, None, None)
+    }
+}
+
 impl S3 {
     /// Creates new Rusoto based high level S3 client with default settings.
-    pub fn new(region: Region) -> S3 {
-        Self::new_with_settings(region, Settings::default())
-    }
+    ///
+    /// * region - set the AWS region to connect to or try to autodetect the region value
+    /// * region_endpoint - use dedicated AWS endpoint within the region
+    /// * settings - use specific client setting
+    pub fn new(
+        region: impl Into<Option<Region>>,
+        region_endpoint: impl Into<Option<String>>,
+        settings: impl Into<Option<Settings>>
+    ) -> S3 {
+        let region = match (region.into(), region_endpoint.into()) {
+            (Some(region), Some(endpoint)) => Region::Custom { name: region.name().to_owned(), endpoint },
+            (None, Some(endpoint)) => Region::Custom { name: Region::default().name().to_owned(), endpoint },
+            (Some(region), None) => region,
+            _ => Region::default(),
+        };
+        let settings = settings.into().unwrap_or_default();
 
-    /// Creates new Rusoto based high level S3 client with given settings.
-    pub fn new_with_settings(region: Region, settings: Settings) -> S3 {
         S3 {
             client: S3Client::new(region),
             on_upload_progress: None,
@@ -435,6 +452,11 @@ impl S3 {
             timeout: settings.timeout,
             data_timeout: settings.data_timeout,
         }
+    }
+
+    /// Creates new Rusoto based high level S3 client with default settings with given region.
+    pub fn with_region(region: Region) -> S3 {
+        S3::new(region, None, None)
     }
 
     /// Gets maximum size of the multipart upload part.
@@ -895,7 +917,7 @@ mod tests {
     fn test_get_body() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -914,7 +936,7 @@ mod tests {
     fn test_object_present() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -929,7 +951,7 @@ mod tests {
     fn test_object_absent() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -946,7 +968,7 @@ mod tests {
     fn test_object_present_empty_read() {
         use std::io::Cursor;
 
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -957,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_object_present_progress() {
-        let mut s3 = S3::new(Region::default());
+        let mut s3 = S3::default();
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
@@ -978,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_given() {
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
@@ -1011,7 +1033,7 @@ mod tests {
 
     #[test]
     fn test_delete_objects_from_list() {
-        let s3 = S3::new(Region::default());
+        let s3 = S3::default();
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
