@@ -158,6 +158,26 @@ impl<'b> Object<'b> {
         }
     }
 
+    pub fn from_key_with_meta(
+        bucket: &Present<Bucket>,
+        key: String,
+        size: Option<i64>,
+        e_tag: Option<String>,
+        last_modified: Option<String>,
+        owner_id: Option<String>,
+        owner_name: Option<String>,
+    ) -> Object {
+        Object {
+            bucket,
+            key,
+            size,
+            e_tag,
+            last_modified,
+            owner_id,
+            owner_name,
+        }
+    }
+
     fn from_s3_object(bucket: &Present<Bucket>, object: S3Object) -> Object {
         let mut owner = object.owner;
         Object {
@@ -473,6 +493,8 @@ impl S3 {
     /// Checks if given object exists.
     ///
     /// * `implementaiton` - select implementation of ths function
+    ///
+    /// Warning: last_modified value may be in different format depending on implementation.
     pub fn check_object_exists<'s, 'b>(&'s self, object: Object<'b>, implementation: CheckObjectImpl) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
         match implementation {
             CheckObjectImpl::List => self.check_object_exists_list(object),
@@ -481,6 +503,9 @@ impl S3 {
     }
 
     /// Checks if given object exists by issuing HeadObject request.
+    ///
+    /// If object is present a new object with e_tag, size and last_modified values set is created.
+    /// Warning: The last_modified time will be in RFC 2822 format.
     ///
     /// Requires `GetObject` premission.
     pub fn check_object_exists_head<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
@@ -495,7 +520,18 @@ impl S3 {
         trace!("Head response: {:?}", res);
 
         match res {
-            Ok(_) => Ok(Left(Present(object))),
+            Ok(res) => {
+                let obj = Object::from_key_with_meta(
+                    object.bucket,
+                    object.key,
+                    res.content_length,
+                    res.e_tag,
+                    res.last_modified, // RFC 2822
+                    None, // N/A
+                    None, // N/A
+                );
+                Ok(Left(Present(obj)))
+            }
             Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => Ok(Right(Absent(object))),
             Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(object))),
             Err(err) => Err(err.into())
@@ -503,6 +539,9 @@ impl S3 {
     }
 
     /// Checks if given object exists by listing objects.
+    ///
+    /// It will use metadata obtained from S3 if object exists.
+    /// Warning: The last_modified time will be in RFC 3339 format.
     ///
     /// Requires `ListBucket` permission.
     pub fn check_object_exists_list<'s, 'b>(&'s self, object: Object<'b>) -> Result<Either<Present<Object<'b>>, Absent<Object<'b>>>, S3SyncError> {
@@ -514,16 +553,17 @@ impl S3 {
         };
 
         let res = self.client.list_objects_v2(request).with_timeout(self.timeout).sync()?;
-        let first_key = res.contents.
-            and_then(|list| list.into_iter().next())
-            .and_then(|obj| obj.key);
-        match first_key {
-            Some(key) if key == object.key => Ok(Left(Present(object))),
+        let first_obj = res.contents.
+            and_then(|list| list.into_iter().next());
+        match first_obj {
+            Some(obj) if obj.key.as_deref().expect("S3 object has no key!") == object.key => Ok(Left(Present(Object::from_s3_object(object.bucket, obj)))),
             _ => Ok(Right(Absent(object)))
         }
     }
 
     /// Provides iterator of objects in existing bucket that have key of given prefix.
+    ///
+    /// Warning: The last_modified time will be in RFC 3339 format.
     pub fn list_objects<'b, 's: 'b>(&'s self, bucket: &'b Present<Bucket>, prefix: String) -> impl Iterator<Item = Result<Present<Object<'b>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         let client = &self.client;
         let pages = PaginationIter {
