@@ -34,7 +34,7 @@ assert_eq!(&body, b"hello world");
 ```
 !*/
 use rusoto_s3::{S3Client, HeadObjectOutput};
-use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier};
+use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier, HeadObjectRequest, HeadObjectError};
 pub use rusoto_core::region::Region;
 use rusoto_core::RusotoError;
 use rusoto_core::request::BufferedHttpResponse;
@@ -556,9 +556,6 @@ impl S3 {
     /// Requires `GetObject` premission.
     pub fn check_object_exists_head<'s, 'b>(&'s self, object: BucketKey<'b>)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
-        use rusoto_s3::HeadObjectRequest;
-        use rusoto_s3::HeadObjectError;
-
         let res = self.client.head_object(HeadObjectRequest {
             bucket: object.bucket.name.clone(),
             key: object.key.clone(),
@@ -641,7 +638,7 @@ impl S3 {
     }
 
     /// Gets object body.
-    pub fn get_body<'s, 'b>(&'s self, object: impl Borrow<Present<BucketKey<'b>>> + 'b) -> Result<impl Read, S3SyncError> {
+    pub fn get_body<'s, 'b>(&'s self, object: &impl Borrow<Present<BucketKey<'b>>>) -> Result<impl Read, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         let object = object.borrow();
         self.client.get_object(GetObjectRequest {
@@ -932,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_body() {
+    fn test_get_body_bucket_key() {
         use std::io::Cursor;
 
         let s3 = S3::default();
@@ -945,6 +942,26 @@ mod tests {
 
         let mut body = Vec::new();
 
+        s3.get_body(&object).unwrap().read_to_end(&mut body).unwrap();
+
+        assert_eq!(&body, b"hello world");
+    }
+
+    #[test]
+    fn test_get_body_object() {
+        use std::io::Cursor;
+
+        let s3 = S3::default();
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        let object = BucketKey::from_string(&bucket, test_key());
+
+        let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
+
+        let mut body = Vec::new();
+
+        let object = s3.check_object_exists(object.invalidate_state(), CheckObjectImpl::Head).unwrap().unwrap_left();
         s3.get_body(&object).unwrap().read_to_end(&mut body).unwrap();
 
         assert_eq!(&body, b"hello world");
