@@ -21,7 +21,8 @@ let test_key = "foobar.test";
 
 let s3 = S3::default();
 
-let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
+let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists")
+    .left().expect("bucket does not exist");
 let bucket_key = BucketKey::from_string(&bucket, test_key);
 
 let body = Cursor::new(b"hello world".to_vec());
@@ -32,7 +33,13 @@ s3.get_body(&object).expect("object body").read_to_end(&mut body).unwrap();
 
 assert_eq!(&body, b"hello world");
 ```
-!*/
+
+Cargo features
+==============
+
+* `chrono` - enables `parse` method on `LastModified`
+
+*/
 use rusoto_s3::{S3Client, HeadObjectOutput};
 use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier, HeadObjectRequest, HeadObjectError, HeadBucketRequest, HeadBucketError};
 pub use rusoto_core::region::Region;
@@ -863,8 +870,7 @@ impl S3 {
     /// Note that if returned iterator is not completely consumed not all items from the list may
     /// be processed.
     ///
-    /// Delete call does not fail if object does not exist and therefore this method can work with
-    /// `Present`, `Absent` or just `Object` values.
+    /// It is not an error to delete non-existing S3 object.
     ///
     /// Objects can live in different buckets but for best performance it is
     /// recommended to order the list by bucket so that biggest batches can be crated.

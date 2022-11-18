@@ -13,20 +13,21 @@ This client wraps Rusoto S3 and provides the following features:
 # Example usage
 
 ```rust
-use s3_sync::{S3, Region, ObjectBodyMeta, Object, Bucket};
+use s3_sync::{S3, Region, ObjectBodyMeta, BucketKey, Bucket};
 use std::io::Cursor;
 use std::io::Read;
 
 let test_bucket = std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET not set");
 let test_key = "foobar.test";
 
-let s3 = S3::new(Region::default());
+let s3 = S3::default();
 
-let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
-let object = Object::from_key(&bucket, test_key.to_owned());
+let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists")
+  .left().expect("bucket does not exist");
+let bucket_key = BucketKey::from_string(&bucket, test_key);
 
 let body = Cursor::new(b"hello world".to_vec());
-let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
+let object = s3.put_object(bucket_key, body, ObjectBodyMeta::default()).unwrap();
 
 let mut body = Vec::new();
 s3.get_body(&object).expect("object body").read_to_end(&mut body).unwrap();
