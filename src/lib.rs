@@ -56,6 +56,8 @@ use either::Either;
 use Either::*;
 use problem::prelude::*;
 use itertools::Itertools;
+#[cfg(feature = "chrono")]
+use chrono::{DateTime, FixedOffset};
 
 // re-export return type crates
 pub use ensure;
@@ -76,6 +78,8 @@ pub enum S3SyncError {
     IoError(std::io::Error),
     NoBodyError,
     MissingObjectMetaData(&'static str),
+    #[cfg(feature = "chrono")]
+    ChronoError(chrono::ParseError),
 }
 
 impl fmt::Display for S3SyncError {
@@ -100,6 +104,8 @@ impl fmt::Display for S3SyncError {
             S3SyncError::IoError(_) => write!(f, "local I/O error"),
             S3SyncError::NoBodyError => write!(f, "expected body but found none"),
             S3SyncError::MissingObjectMetaData(meta) => write!(f, "expected object to have {} value but found none", meta),
+            #[cfg(feature = "chrono")]
+            S3SyncError::ChronoError(_) => write!(f, "error parsing timestamp"),
         }
     }
 }
@@ -111,6 +117,8 @@ impl Error for S3SyncError {
             S3SyncError::IoError(err) => Some(err),
             S3SyncError::NoBodyError => None,
             S3SyncError::MissingObjectMetaData(_) => None,
+            #[cfg(feature = "chrono")]
+            S3SyncError::ChronoError(err) => Some(err),
         }
     }
 }
@@ -131,6 +139,13 @@ impl<T: Error + 'static> From<RusotoError<T>> for S3SyncError {
 impl From<std::io::Error> for S3SyncError {
     fn from(err: std::io::Error) -> S3SyncError {
         S3SyncError::IoError(err)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::ParseError> for S3SyncError {
+    fn from(err: chrono::ParseError) -> S3SyncError {
+        S3SyncError::ChronoError(err)
     }
 }
 
@@ -161,7 +176,7 @@ impl<'b> BucketKey<'b> {
     pub fn key(&self) -> &str {
         &self.key
     }
-    
+
     /// Makes an assumption that the object does exist on S3 without making an API call to verify.
     pub fn assume_present(self) -> Present<BucketKey<'b>> {
         Present(self)
@@ -198,13 +213,46 @@ impl<'b> From<Absent<BucketKey<'b>>> for BucketKey<'b> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastModified {
+    /// Date and time in RFC2822 format.
+    Rfc2822(String),
+    /// Date and time in RFC3339 format.
+    Rfc3339(String),
+}
+
+impl fmt::Display for LastModified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl LastModified {
+    /// Gets timestamp string that may be in different format.
+    pub fn as_str(&self) -> &str {
+        match self {
+            LastModified::Rfc2822(dt) => &dt,
+            LastModified::Rfc3339(dt) => &dt,
+        }
+    }
+
+    #[cfg(feature = "chrono")]
+    /// Returns parsed date and time.
+    pub fn parse(&self) -> Result<DateTime<FixedOffset>, S3SyncError> {
+        Ok(match &self {
+            LastModified::Rfc2822(lm) => DateTime::parse_from_rfc2822(lm),
+            LastModified::Rfc3339(lm) => DateTime::parse_from_rfc3339(lm),
+        }?)
+    }
+}
+
 /// Represents existing object in a bucket.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Object<'b> {
     pub bucket_key: Present<BucketKey<'b>>,
     pub size: i64,
     pub e_tag: String,
-    pub last_modified: String,
+    pub last_modified: LastModified,
 }
 
 impl<'b> Object<'b> {
@@ -215,7 +263,7 @@ impl<'b> Object<'b> {
         Ok(Object {
             bucket_key: Present(bucket_key),
             e_tag: res.e_tag.ok_or(S3SyncError::MissingObjectMetaData("e_tag"))?,
-            last_modified: res.last_modified.ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?, // RFC 2822
+            last_modified: res.last_modified.map(LastModified::Rfc2822).ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?,
             size: res.content_length.ok_or(S3SyncError::MissingObjectMetaData("content_length"))?,
         })
     }
@@ -224,7 +272,7 @@ impl<'b> Object<'b> {
         Ok(Object {
             bucket_key: Present(BucketKey::from_string(bucket, object.key.ok_or(S3SyncError::MissingObjectMetaData("key"))?)),
             e_tag: object.e_tag.ok_or(S3SyncError::MissingObjectMetaData("e_tag"))?,
-            last_modified: object.last_modified.ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?,
+            last_modified: object.last_modified.map(LastModified::Rfc3339).ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?,
             size: object.size.ok_or(S3SyncError::MissingObjectMetaData("size"))?,
         })
     }
@@ -232,6 +280,11 @@ impl<'b> Object<'b> {
     /// Gets `BucketKey` reference.
     pub fn bucket_key(&self) -> &Present<BucketKey<'b>> {
         &self.bucket_key
+    }
+
+    /// Unwraps inner `BucketKey`.
+    pub fn unwrap_bucket_key(self) -> Present<BucketKey<'b>> {
+        self.bucket_key
     }
 
     /// Gets objects bucket.
@@ -255,7 +308,7 @@ impl<'b> Object<'b> {
     }
 
     /// Gets object last modified time.
-    pub fn last_modified(&self) -> &str {
+    pub fn last_modified(&self) -> &LastModified {
         &self.last_modified
     }
 }
@@ -1118,5 +1171,44 @@ mod tests {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/baz-2")
         });
+    }
+
+    #[test]
+    fn test_object_last_modified() {
+        use std::io::Cursor;
+
+        let s3 = S3::default();
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        let object = BucketKey::from_string(&bucket, test_key());
+
+        let object = s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+
+        let object = s3.check_object_exists(object.invalidate_state(), CheckObjectImpl::Head).unwrap().unwrap_left();
+        matches!(object.last_modified(), LastModified::Rfc2822(_));
+
+        let object = s3.check_object_exists(object.unwrap_bucket_key().invalidate_state(), CheckObjectImpl::List).unwrap().unwrap_left();
+        matches!(object.last_modified(), LastModified::Rfc3339(_));
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn test_object_last_modified_chrono() {
+        use std::io::Cursor;
+
+        let s3 = S3::default();
+        let body = Cursor::new(b"hello world".to_vec());
+
+        let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
+        let object = BucketKey::from_string(&bucket, test_key());
+
+        let object = s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
+
+        let object = s3.check_object_exists(object.invalidate_state(), CheckObjectImpl::Head).unwrap().unwrap_left();
+        assert!(object.last_modified().parse().is_ok());
+
+        let object = s3.check_object_exists(object.unwrap_bucket_key().invalidate_state(), CheckObjectImpl::List).unwrap().unwrap_left();
+        assert!(object.last_modified().parse().is_ok());
     }
 }
