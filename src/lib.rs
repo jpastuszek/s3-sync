@@ -648,6 +648,28 @@ impl S3 {
         .map(|body| body.into_blocking_read())
     }
 
+    /// Gets object body retrying the operation in case of error.
+    ///
+    /// * retires - retry get_body call up to that many times
+    /// * on_error - called when get_body call fails and there are still retries left; if gets number of retries left and the error and if it returns false the retry loop is aboreted
+    ///
+    /// Note: The `on_error` closure should potentially pause execution of the thread to deley next retry attempt.
+    /// Note: Once this function returns the subsequent read operation failures are not retried.
+    pub fn get_body_with_retry<'s, 'b, F>(&'s self, object: &impl Borrow<Present<BucketKey<'b>>>, mut retries: u32, on_error: F)
+        -> Result<impl Read, S3SyncError> where F: Fn(u32, &S3SyncError) -> bool {
+        loop {
+            match self.get_body(object) {
+                Ok(body) => return Ok(body),
+                Err(err) => {
+                    if retries == 0 || !on_error(retries, &err) {
+                        return Err(err)
+                    }
+                    retries -= 1;
+                }
+            }
+        }
+    }
+
     /// Puts object with given body using multipart API.
     ///
     /// If given existing object it will be overwritten.
