@@ -22,10 +22,10 @@ let test_key = "foobar.test";
 let s3 = S3::default();
 
 let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
-let object_key = BucketKey::from_string(&bucket, test_key);
+let bucket_key = BucketKey::from_string(&bucket, test_key);
 
 let body = Cursor::new(b"hello world".to_vec());
-let object = s3.put_object(object_key, body, ObjectBodyMeta::default()).unwrap();
+let object = s3.put_object(bucket_key, body, ObjectBodyMeta::default()).unwrap();
 
 let mut body = Vec::new();
 s3.get_body(&object).expect("object body").read_to_end(&mut body).unwrap();
@@ -34,7 +34,7 @@ assert_eq!(&body, b"hello world");
 ```
 !*/
 use rusoto_s3::{S3Client, HeadObjectOutput};
-use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier, HeadObjectRequest, HeadObjectError};
+use rusoto_s3::{DeleteObjectRequest, DeleteObjectsRequest, Delete, ObjectIdentifier, HeadObjectRequest, HeadObjectError, HeadBucketRequest, HeadBucketError};
 pub use rusoto_core::region::Region;
 use rusoto_core::RusotoError;
 use rusoto_core::request::BufferedHttpResponse;
@@ -134,7 +134,7 @@ impl From<std::io::Error> for S3SyncError {
     }
 }
 
-/// Represents key to an object in a bucket.
+/// Represents key to an object key in a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketKey<'b> {
     pub bucket: &'b Present<Bucket>,
@@ -162,7 +162,7 @@ impl<'b> BucketKey<'b> {
         &self.key
     }
     
-    /// Makes an assumption that the object represented by this object does exist without making an API call to verify.
+    /// Makes an assumption that the object does exist on S3 without making an API call to verify.
     pub fn assume_present(self) -> Present<BucketKey<'b>> {
         Present(self)
     }
@@ -170,13 +170,13 @@ impl<'b> BucketKey<'b> {
 
 impl<'b> From<Object<'b>> for BucketKey<'b> {
     fn from(obj: Object<'b>) -> BucketKey<'b> {
-        obj.key.0
+        obj.bucket_key.0
     }
 }
 
 impl<'b> From<Object<'b>> for Present<BucketKey<'b>> {
     fn from(obj: Object<'b>) -> Present<BucketKey<'b>> {
-        obj.key
+        obj.bucket_key
     }
 }
 
@@ -201,7 +201,7 @@ impl<'b> From<Absent<BucketKey<'b>>> for BucketKey<'b> {
 /// Represents existing object in a bucket.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Object<'b> {
-    pub key: Present<BucketKey<'b>>,
+    pub bucket_key: Present<BucketKey<'b>>,
     pub size: i64,
     pub e_tag: String,
     pub last_modified: String,
@@ -209,11 +209,11 @@ pub struct Object<'b> {
 
 impl<'b> Object<'b> {
     fn from_head(
-        key: BucketKey<'b>,
+        bucket_key: BucketKey<'b>,
         res: HeadObjectOutput,
     ) -> Result<Object, S3SyncError> {
         Ok(Object {
-            key: Present(key),
+            bucket_key: Present(bucket_key),
             e_tag: res.e_tag.ok_or(S3SyncError::MissingObjectMetaData("e_tag"))?,
             last_modified: res.last_modified.ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?, // RFC 2822
             size: res.content_length.ok_or(S3SyncError::MissingObjectMetaData("content_length"))?,
@@ -222,7 +222,7 @@ impl<'b> Object<'b> {
 
     fn from_s3_object(bucket: &Present<Bucket>, object: S3Object) -> Result<Object, S3SyncError> {
         Ok(Object {
-            key: Present(BucketKey::from_string(bucket, object.key.ok_or(S3SyncError::MissingObjectMetaData("key"))?)),
+            bucket_key: Present(BucketKey::from_string(bucket, object.key.ok_or(S3SyncError::MissingObjectMetaData("key"))?)),
             e_tag: object.e_tag.ok_or(S3SyncError::MissingObjectMetaData("e_tag"))?,
             last_modified: object.last_modified.ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?,
             size: object.size.ok_or(S3SyncError::MissingObjectMetaData("size"))?,
@@ -231,17 +231,17 @@ impl<'b> Object<'b> {
 
     /// Gets `BucketKey` reference.
     pub fn bucket_key(&self) -> &Present<BucketKey<'b>> {
-        &self.key
+        &self.bucket_key
     }
 
     /// Gets objects bucket.
     pub fn bucket(&self) -> &Present<Bucket> {
-        self.key.bucket
+        self.bucket_key.bucket
     }
 
     /// Gets object key string.
     pub fn key(&self) -> &str {
-        &self.key.key
+        &self.bucket_key.key
     }
 
     /// Gets object size.
@@ -518,9 +518,6 @@ impl S3 {
 
     /// Checks if given bucket exists.
     pub fn check_bucket_exists(&self, bucket: Bucket) -> Result<Either<Present<Bucket>, Absent<Bucket>>, S3SyncError> {
-        use rusoto_s3::HeadBucketRequest;
-        use rusoto_s3::HeadBucketError;
-
         let res = self.client.head_bucket(HeadBucketRequest {
             bucket: bucket.name.clone(),
             .. Default::default()
@@ -540,11 +537,11 @@ impl S3 {
     /// * `implementaiton` - select implementation of ths function
     ///
     /// Warning: last_modified value may be in different format depending on implementation.
-    pub fn check_object_exists<'s, 'b>(&'s self, object: BucketKey<'b>, implementation: CheckObjectImpl)
+    pub fn check_object_exists<'s, 'b>(&'s self, bucket_key: BucketKey<'b>, implementation: CheckObjectImpl)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         match implementation {
-            CheckObjectImpl::List => self.check_object_exists_list(object),
-            CheckObjectImpl::Head => self.check_object_exists_head(object),
+            CheckObjectImpl::List => self.check_object_exists_list(bucket_key),
+            CheckObjectImpl::Head => self.check_object_exists_head(bucket_key),
         }
     }
 
@@ -554,19 +551,19 @@ impl S3 {
     /// Warning: The last_modified time will be in RFC 2822 format.
     ///
     /// Requires `GetObject` premission.
-    pub fn check_object_exists_head<'s, 'b>(&'s self, object: BucketKey<'b>)
+    pub fn check_object_exists_head<'s, 'b>(&'s self, bucket_key: BucketKey<'b>)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         let res = self.client.head_object(HeadObjectRequest {
-            bucket: object.bucket.name.clone(),
-            key: object.key.clone(),
+            bucket: bucket_key.bucket.name.clone(),
+            key: bucket_key.key.clone(),
             .. Default::default()
         }).with_timeout(self.timeout).sync();
         trace!("Head response: {:?}", res);
 
         match res {
-            Ok(res) => Ok(Left(Object::from_head(object, res)?)),
-            Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => Ok(Right(Absent(object))),
-            Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(object))),
+            Ok(res) => Ok(Left(Object::from_head(bucket_key, res)?)),
+            Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => Ok(Right(Absent(bucket_key))),
+            Err(RusotoError::Unknown(BufferedHttpResponse { status, .. })) if status.as_u16() == 404 => Ok(Right(Absent(bucket_key))),
             Err(err) => Err(err.into())
         }
     }
@@ -577,11 +574,11 @@ impl S3 {
     /// Warning: The last_modified time will be in RFC 3339 format.
     ///
     /// Requires `ListBucket` permission.
-    pub fn check_object_exists_list<'s, 'b>(&'s self, object: BucketKey<'b>)
+    pub fn check_object_exists_list<'s, 'b>(&'s self, bucket_key: BucketKey<'b>)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         let request = ListObjectsV2Request {
-            bucket: object.bucket.name().to_owned(),
-            prefix: Some(object.key.clone()),
+            bucket: bucket_key.bucket.name().to_owned(),
+            prefix: Some(bucket_key.key.clone()),
             max_keys: Some(1),
             .. Default::default()
         };
@@ -590,8 +587,8 @@ impl S3 {
         let first_obj = res.contents.
             and_then(|list| list.into_iter().next());
         match first_obj {
-            Some(obj) if obj.key.as_deref().expect("S3 object has no key!") == object.key => Ok(Left(Object::from_s3_object(object.bucket, obj)?)),
-            _ => Ok(Right(Absent(object)))
+            Some(obj) if obj.key.as_deref().expect("S3 object has no key!") == bucket_key.key => Ok(Left(Object::from_s3_object(bucket_key.bucket, obj)?)),
+            _ => Ok(Right(Absent(bucket_key)))
         }
     }
 
@@ -638,12 +635,12 @@ impl S3 {
     }
 
     /// Gets object body.
-    pub fn get_body<'s, 'b>(&'s self, object: &impl Borrow<Present<BucketKey<'b>>>) -> Result<impl Read, S3SyncError> {
+    pub fn get_body<'s, 'b>(&'s self, bucket_key: &impl Borrow<Present<BucketKey<'b>>>) -> Result<impl Read, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
-        let object = object.borrow();
+        let bucket_key= bucket_key.borrow();
         self.client.get_object(GetObjectRequest {
-            bucket: object.bucket.name.clone(),
-            key: object.key.clone(),
+            bucket: bucket_key.bucket.name.clone(),
+            key: bucket_key.key.clone(),
             .. Default::default()
         }).with_timeout(self.data_timeout).sync()
         .map_err(Into::into)
@@ -658,18 +655,18 @@ impl S3 {
     /// Use `.max_upload_size()` to find out how many bytes the body can have at maximum.
     /// Increase `part_size` to be able to upload more date (`max_upload_size = part_number *
     /// 10_000`).
-    pub fn put_object<'s, 'b>(&'s self, object: impl Into<BucketKey<'b>>, mut body: impl Read, meta: ObjectBodyMeta)
+    pub fn put_object<'s, 'b>(&'s self, bucket_key: impl Into<BucketKey<'b>>, mut body: impl Read, meta: ObjectBodyMeta)
         -> Result<Present<BucketKey<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
 
-        let object = object.into();
-        let bucket_name = object.bucket.name.clone();
-        let object_key = object.key.clone();
+        let bucket_key = bucket_key.into();
+        let bucket_name = bucket_key.bucket.name.clone();
+        let object_key = bucket_key.key.clone();
 
         let upload_id = self.client.create_multipart_upload(CreateMultipartUploadRequest {
-            bucket: object.bucket.name.clone(),
-            key: object.key.clone(),
+            bucket: bucket_name.clone(),
+            key: object_key.clone(),
             content_type: Some(meta.content_type),
             content_disposition: meta.content_disposition,
             content_language: meta.content_language,
@@ -744,7 +741,7 @@ impl S3 {
                 .. Default::default()
             }).with_timeout(self.timeout).sync()?;
 
-            Ok(Present(object))
+            Ok(Present(bucket_key))
         }();
 
         if let Err(err) = &result {
@@ -773,17 +770,17 @@ impl S3 {
     ///
     /// To delete many objects it is better performance wise to use `.delete_objects()` witch
     /// uses bulk delete API.
-    pub fn delete_object<'b, 's: 'b>(&'s self, object: impl Into<BucketKey<'b>>) -> Result<Absent<BucketKey<'b>>, S3SyncError> {
-        let object = object.into();
-        debug!("Deleting object {:?} from S3 bucket {:?}", object.key, object.bucket.name);
+    pub fn delete_object<'b, 's: 'b>(&'s self, bucket_key: impl Into<BucketKey<'b>>) -> Result<Absent<BucketKey<'b>>, S3SyncError> {
+        let bucket_key = bucket_key.into();
+        debug!("Deleting object {:?} from S3 bucket {:?}",bucket_key.key, bucket_key.bucket.name);
         let res = self.client.delete_object(DeleteObjectRequest {
-            bucket: object.bucket.name.clone(),
-            key: object.key.clone(),
+            bucket: bucket_key.bucket.name.clone(),
+            key: bucket_key.key.clone(),
             .. Default::default()
         }).with_timeout(self.timeout).sync()?;
         trace!("Delete response: {:?}", res);
 
-        Ok(Absent(object))
+        Ok(Absent(bucket_key))
     }
 
     /// Deletes list of objects in streaming fashion using bulk delete API.
@@ -800,31 +797,31 @@ impl S3 {
     /// Each returned item represent batch delete call to S3 API.
     /// Successful batch call will return `Ok` variant containing vector of results for each
     /// individual object delete operation as provided by S3.
-    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl Into<BucketKey<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<BucketKey<'b>>, (BucketKey<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
-        objects
+    pub fn delete_objects<'b, 's: 'b>(&'s self, bucket_keys: impl IntoIterator<Item = impl Into<BucketKey<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<BucketKey<'b>>, (BucketKey<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
+        bucket_keys
             .into_iter()
             .map(|o| o.into())
             .peekable()
-            .batching(|objects| {
-                let current_bucket_name = if let Some(object) = objects.peek() {
-                    object.bucket.name.clone()
+            .batching(|bucket_keys| {
+                let current_bucket_name = if let Some(bucket_key) = bucket_keys.peek() {
+                    bucket_key.bucket.name.clone()
                 } else {
                     return None
                 };
 
                 Some((current_bucket_name.clone(),
-                     objects
+                     bucket_keys
                         .peeking_take_while(move |object| object.bucket.name == current_bucket_name)
                         .take(DELETE_BATCH_SIZE)
                         .collect::<Vec<_>>()))
             })
-            .map(move |(current_bucket_name, objects): (_, Vec<_>)| {
-                debug!("Deleting batch of {} objects from S3 bucket {:?}", objects.len(), current_bucket_name);
+            .map(move |(current_bucket_name, bucket_keys): (_, Vec<_>)| {
+                debug!("Deleting batch of {} objects from S3 bucket {:?}", bucket_keys.len(), current_bucket_name);
                 let res = self.client.delete_objects(DeleteObjectsRequest {
                     bucket: current_bucket_name.clone(),
                     delete: Delete {
-                        objects: objects.iter().map(|object| ObjectIdentifier {
-                            key: object.key.clone(),
+                        objects: bucket_keys.iter().map(|bucket_key| ObjectIdentifier {
+                            key: bucket_key.key.clone(),
                             .. Default::default()
                         }).collect::<Vec<_>>(),
                         .. Default::default()
@@ -865,13 +862,13 @@ impl S3 {
                     Default::default()
                 };
 
-                Ok(objects.into_iter().map(|o| {
-                    if ok_objects.contains(&o.key) {
-                        Ok(Absent(o))
-                    } else if let Some(err) = failed_objects.remove(&o.key) {
-                        Err((o, err))
+                Ok(bucket_keys.into_iter().map(|k| {
+                    if ok_objects.contains(&k.key) {
+                        Ok(Absent(k))
+                    } else if let Some(err) = failed_objects.remove(&k.key) {
+                        Err((k, err))
                     } else {
-                        Err((o, S3SyncError::RusotoError(RusotoError::Validation("S3 did not report this object as deleted or failed to be deleted".to_owned()))))
+                        Err((k, S3SyncError::RusotoError(RusotoError::Validation("S3 did not report this object as deleted or failed to be deleted".to_owned()))))
                     }
                 }).collect::<Vec<_>>()) // Option<Result<Vec<Result<,>,>>
             })
@@ -884,10 +881,10 @@ impl S3 {
     ///
     /// Note that there can be a race condition between check if object exists and upload.
     pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>
-        (&'s self, object: BucketKey<'b>, check_impl: CheckObjectImpl, body: F)
+        (&'s self, bucket_key: BucketKey<'b>, check_impl: CheckObjectImpl, body: F)
         -> impl Ensure<Present<BucketKey<'b>>, EnsureAction = impl Meet<Met = Present<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
-            Ok(match self.check_object_exists(object, check_impl)? {
+            Ok(match self.check_object_exists(bucket_key, check_impl)? {
                 Left(present) => Met(present.into()),
                 Right(absent) => EnsureAction(move || {
                     let (body, meta) = body()?;
@@ -900,9 +897,9 @@ impl S3 {
     /// Returns `Ensure` object that can be used to ensure that object is absent in the S3 bucket.
     ///
     /// Note that there can be a race condition between check if object exists and delete operation.
-    pub fn object_absent<'b, 's: 'b>(&'s self, object: BucketKey<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<BucketKey<'b>>, EnsureAction = impl Meet<Met = Absent<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_absent<'b, 's: 'b>(&'s self, bucket_key: BucketKey<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<BucketKey<'b>>, EnsureAction = impl Meet<Met = Absent<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
-            Ok(match self.check_object_exists(object, check_impl)? {
+            Ok(match self.check_object_exists(bucket_key, check_impl)? {
                 Right(absent) => Met(absent),
                 Left(present) => EnsureAction(move || {
                     self.delete_object(present)
