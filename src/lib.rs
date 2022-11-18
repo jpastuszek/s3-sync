@@ -12,7 +12,7 @@ Example usage
 =============
 
 ```rust
-use s3_sync::{S3, Region, ObjectBodyMeta, ObjectKey, Bucket};
+use s3_sync::{S3, Region, ObjectBodyMeta, BucketKey, Bucket};
 use std::io::Cursor;
 use std::io::Read;
 
@@ -22,7 +22,7 @@ let test_key = "foobar.test";
 let s3 = S3::default();
 
 let bucket = s3.check_bucket_exists(Bucket::from_name(test_bucket)).expect("check if bucket exists").left().expect("bucket does not exist");
-let object_key = ObjectKey::from_string(&bucket, test_key);
+let object_key = BucketKey::from_string(&bucket, test_key);
 
 let body = Cursor::new(b"hello world".to_vec());
 let object = s3.put_object(object_key, body, ObjectBodyMeta::default()).unwrap();
@@ -136,17 +136,17 @@ impl From<std::io::Error> for S3SyncError {
 
 /// Represents key to an object in a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectKey<'b> {
+pub struct BucketKey<'b> {
     pub bucket: &'b Present<Bucket>,
     pub key: String,
 }
 
-impl External for ObjectKey<'_> {}
+impl External for BucketKey<'_> {}
 
-impl<'b> ObjectKey<'b> {
-    /// Creates `ObjectKey` from present `Bucket` and given key `String`.
-    pub fn from_string(bucket: &Present<Bucket>, key: impl Into<String>) -> ObjectKey {
-        ObjectKey {
+impl<'b> BucketKey<'b> {
+    /// Creates `BucketKey` from present `Bucket` and given key `String`.
+    pub fn from_string(bucket: &Present<Bucket>, key: impl Into<String>) -> BucketKey {
+        BucketKey {
             bucket,
             key: key.into(),
         }
@@ -161,34 +161,39 @@ impl<'b> ObjectKey<'b> {
     pub fn key(&self) -> &str {
         &self.key
     }
+    
+    /// Makes an assumption that the object represented by this object does exist without making an API call to verify.
+    pub fn assume_present(self) -> Present<BucketKey<'b>> {
+        Present(self)
+    }
 }
 
-impl<'b> From<Object<'b>> for ObjectKey<'b> {
-    fn from(obj: Object<'b>) -> ObjectKey<'b> {
+impl<'b> From<Object<'b>> for BucketKey<'b> {
+    fn from(obj: Object<'b>) -> BucketKey<'b> {
         obj.key.0
     }
 }
 
-impl<'b> From<Object<'b>> for Present<ObjectKey<'b>> {
-    fn from(obj: Object<'b>) -> Present<ObjectKey<'b>> {
+impl<'b> From<Object<'b>> for Present<BucketKey<'b>> {
+    fn from(obj: Object<'b>) -> Present<BucketKey<'b>> {
         obj.key
     }
 }
 
-impl<'b> Borrow<Present<ObjectKey<'b>>> for Object<'b> {
-    fn borrow(&self) -> &Present<ObjectKey<'b>> {
-        self.key()
+impl<'b> Borrow<Present<BucketKey<'b>>> for Object<'b> {
+    fn borrow(&self) -> &Present<BucketKey<'b>> {
+        self.bucket_key()
     }
 }
 
-impl<'b> From<Present<ObjectKey<'b>>> for ObjectKey<'b> {
-    fn from(obj: Present<ObjectKey<'b>>) -> ObjectKey<'b> {
+impl<'b> From<Present<BucketKey<'b>>> for BucketKey<'b> {
+    fn from(obj: Present<BucketKey<'b>>) -> BucketKey<'b> {
         obj.0
     }
 }
 
-impl<'b> From<Absent<ObjectKey<'b>>> for ObjectKey<'b> {
-    fn from(obj: Absent<ObjectKey<'b>>) -> ObjectKey<'b> {
+impl<'b> From<Absent<BucketKey<'b>>> for BucketKey<'b> {
+    fn from(obj: Absent<BucketKey<'b>>) -> BucketKey<'b> {
         obj.0
     }
 }
@@ -196,7 +201,7 @@ impl<'b> From<Absent<ObjectKey<'b>>> for ObjectKey<'b> {
 /// Represents existing object in a bucket.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Object<'b> {
-    pub key: Present<ObjectKey<'b>>,
+    pub key: Present<BucketKey<'b>>,
     pub size: i64,
     pub e_tag: String,
     pub last_modified: String,
@@ -204,7 +209,7 @@ pub struct Object<'b> {
 
 impl<'b> Object<'b> {
     fn from_head(
-        key: ObjectKey<'b>,
+        key: BucketKey<'b>,
         res: HeadObjectOutput,
     ) -> Result<Object, S3SyncError> {
         Ok(Object {
@@ -217,11 +222,16 @@ impl<'b> Object<'b> {
 
     fn from_s3_object(bucket: &Present<Bucket>, object: S3Object) -> Result<Object, S3SyncError> {
         Ok(Object {
-            key: Present(ObjectKey::from_string(bucket, object.key.ok_or(S3SyncError::MissingObjectMetaData("key"))?)),
+            key: Present(BucketKey::from_string(bucket, object.key.ok_or(S3SyncError::MissingObjectMetaData("key"))?)),
             e_tag: object.e_tag.ok_or(S3SyncError::MissingObjectMetaData("e_tag"))?,
             last_modified: object.last_modified.ok_or(S3SyncError::MissingObjectMetaData("last_modified"))?,
             size: object.size.ok_or(S3SyncError::MissingObjectMetaData("size"))?,
         })
+    }
+
+    /// Gets `BucketKey` reference.
+    pub fn bucket_key(&self) -> &Present<BucketKey<'b>> {
+        &self.key
     }
 
     /// Gets objects bucket.
@@ -229,13 +239,8 @@ impl<'b> Object<'b> {
         self.key.bucket
     }
 
-    /// Gets object key.
-    pub fn key(&self) -> &Present<ObjectKey<'b>> {
-        &self.key
-    }
-
     /// Gets object key string.
-    pub fn key_as_str(&self) -> &str {
+    pub fn key(&self) -> &str {
         &self.key.key
     }
 
@@ -535,8 +540,8 @@ impl S3 {
     /// * `implementaiton` - select implementation of ths function
     ///
     /// Warning: last_modified value may be in different format depending on implementation.
-    pub fn check_object_exists<'s, 'b>(&'s self, object: ObjectKey<'b>, implementation: CheckObjectImpl)
-        -> Result<Either<Object<'b>, Absent<ObjectKey<'b>>>, S3SyncError> {
+    pub fn check_object_exists<'s, 'b>(&'s self, object: BucketKey<'b>, implementation: CheckObjectImpl)
+        -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         match implementation {
             CheckObjectImpl::List => self.check_object_exists_list(object),
             CheckObjectImpl::Head => self.check_object_exists_head(object),
@@ -549,8 +554,8 @@ impl S3 {
     /// Warning: The last_modified time will be in RFC 2822 format.
     ///
     /// Requires `GetObject` premission.
-    pub fn check_object_exists_head<'s, 'b>(&'s self, object: ObjectKey<'b>)
-        -> Result<Either<Object<'b>, Absent<ObjectKey<'b>>>, S3SyncError> {
+    pub fn check_object_exists_head<'s, 'b>(&'s self, object: BucketKey<'b>)
+        -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         use rusoto_s3::HeadObjectRequest;
         use rusoto_s3::HeadObjectError;
 
@@ -575,8 +580,8 @@ impl S3 {
     /// Warning: The last_modified time will be in RFC 3339 format.
     ///
     /// Requires `ListBucket` permission.
-    pub fn check_object_exists_list<'s, 'b>(&'s self, object: ObjectKey<'b>)
-        -> Result<Either<Object<'b>, Absent<ObjectKey<'b>>>, S3SyncError> {
+    pub fn check_object_exists_list<'s, 'b>(&'s self, object: BucketKey<'b>)
+        -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         let request = ListObjectsV2Request {
             bucket: object.bucket.name().to_owned(),
             prefix: Some(object.key.clone()),
@@ -636,7 +641,7 @@ impl S3 {
     }
 
     /// Gets object body.
-    pub fn get_body<'s, 'b>(&'s self, object: impl Borrow<Present<ObjectKey<'b>>> + 'b) -> Result<impl Read, S3SyncError> {
+    pub fn get_body<'s, 'b>(&'s self, object: impl Borrow<Present<BucketKey<'b>>> + 'b) -> Result<impl Read, S3SyncError> {
         use rusoto_s3::GetObjectRequest;
         let object = object.borrow();
         self.client.get_object(GetObjectRequest {
@@ -656,8 +661,8 @@ impl S3 {
     /// Use `.max_upload_size()` to find out how many bytes the body can have at maximum.
     /// Increase `part_size` to be able to upload more date (`max_upload_size = part_number *
     /// 10_000`).
-    pub fn put_object<'s, 'b>(&'s self, object: impl Into<ObjectKey<'b>>, mut body: impl Read, meta: ObjectBodyMeta)
-        -> Result<Present<ObjectKey<'b>>, S3SyncError> {
+    pub fn put_object<'s, 'b>(&'s self, object: impl Into<BucketKey<'b>>, mut body: impl Read, meta: ObjectBodyMeta)
+        -> Result<Present<BucketKey<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
         use rusoto_core::ByteStream;
 
@@ -771,7 +776,7 @@ impl S3 {
     ///
     /// To delete many objects it is better performance wise to use `.delete_objects()` witch
     /// uses bulk delete API.
-    pub fn delete_object<'b, 's: 'b>(&'s self, object: impl Into<ObjectKey<'b>>) -> Result<Absent<ObjectKey<'b>>, S3SyncError> {
+    pub fn delete_object<'b, 's: 'b>(&'s self, object: impl Into<BucketKey<'b>>) -> Result<Absent<BucketKey<'b>>, S3SyncError> {
         let object = object.into();
         debug!("Deleting object {:?} from S3 bucket {:?}", object.key, object.bucket.name);
         let res = self.client.delete_object(DeleteObjectRequest {
@@ -798,7 +803,7 @@ impl S3 {
     /// Each returned item represent batch delete call to S3 API.
     /// Successful batch call will return `Ok` variant containing vector of results for each
     /// individual object delete operation as provided by S3.
-    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl Into<ObjectKey<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<ObjectKey<'b>>, (ObjectKey<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
+    pub fn delete_objects<'b, 's: 'b>(&'s self, objects: impl IntoIterator<Item = impl Into<BucketKey<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<BucketKey<'b>>, (BucketKey<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         objects
             .into_iter()
             .map(|o| o.into())
@@ -882,8 +887,8 @@ impl S3 {
     ///
     /// Note that there can be a race condition between check if object exists and upload.
     pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>
-        (&'s self, object: ObjectKey<'b>, check_impl: CheckObjectImpl, body: F)
-        -> impl Ensure<Present<ObjectKey<'b>>, EnsureAction = impl Meet<Met = Present<ObjectKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+        (&'s self, object: BucketKey<'b>, check_impl: CheckObjectImpl, body: F)
+        -> impl Ensure<Present<BucketKey<'b>>, EnsureAction = impl Meet<Met = Present<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(object, check_impl)? {
                 Left(present) => Met(present.into()),
@@ -898,7 +903,7 @@ impl S3 {
     /// Returns `Ensure` object that can be used to ensure that object is absent in the S3 bucket.
     ///
     /// Note that there can be a race condition between check if object exists and delete operation.
-    pub fn object_absent<'b, 's: 'b>(&'s self, object: ObjectKey<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<ObjectKey<'b>>, EnsureAction = impl Meet<Met = Absent<ObjectKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
+    pub fn object_absent<'b, 's: 'b>(&'s self, object: BucketKey<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<BucketKey<'b>>, EnsureAction = impl Meet<Met = Absent<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(object, check_impl)? {
                 Right(absent) => Met(absent),
@@ -934,7 +939,7 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        let object = ObjectKey::from_string(&bucket, test_key());
+        let object = BucketKey::from_string(&bucket, test_key());
 
         let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap();
 
@@ -953,7 +958,7 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        let object = ObjectKey::from_string(&bucket, test_key());
+        let object = BucketKey::from_string(&bucket, test_key());
 
         let object = s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure().or_failed_to("make object present");
 
@@ -968,7 +973,7 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        let object = ObjectKey::from_string(&bucket, test_key());
+        let object = BucketKey::from_string(&bucket, test_key());
 
         let object = s3.put_object(object, body, ObjectBodyMeta::default()).unwrap().invalidate_state();
 
@@ -985,7 +990,7 @@ mod tests {
         let body = Cursor::new(b"".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        let object = ObjectKey::from_string(&bucket, test_key());
+        let object = BucketKey::from_string(&bucket, test_key());
 
         assert_matches!(s3.object_present(object, CheckObjectImpl::List, move || Ok((body, ObjectBodyMeta::default()))).ensure(), Err(S3SyncError::NoBodyError));
     }
@@ -996,7 +1001,7 @@ mod tests {
         let body = Cursor::new(b"hello world".to_vec());
 
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
-        let object = ObjectKey::from_string(&bucket, test_key());
+        let object = BucketKey::from_string(&bucket, test_key());
 
         let asserts: Vec<Box<dyn Fn(&TransferStatus)>> = vec![
             Box::new(|t| assert_matches!(t, TransferStatus::Init)),
@@ -1018,8 +1023,8 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
         let objects = vec![
-            ObjectKey::from_string(&bucket, "s3-sync-test/bar-1".to_owned()),
-            ObjectKey::from_string(&bucket, "s3-sync-test/bar-2".to_owned()),
+            BucketKey::from_string(&bucket, "s3-sync-test/bar-1".to_owned()),
+            BucketKey::from_string(&bucket, "s3-sync-test/bar-2".to_owned()),
         ];
 
         for object in objects.clone() {
@@ -1033,12 +1038,12 @@ mod tests {
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
 
-        assert_matches!(&ops[0][0], Ok(Absent(ObjectKey { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][0], Ok(Absent(BucketKey { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/bar-1")
         });
 
-        assert_matches!(&ops[0][1], Ok(Absent(ObjectKey { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][1], Ok(Absent(BucketKey { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/bar-2")
         });
@@ -1051,9 +1056,9 @@ mod tests {
         let bucket = s3.check_bucket_exists(s3_test_bucket()).or_failed_to("check if bucket exists").left().expect("bucket does not exist");
 
         let objects = vec![
-            ObjectKey::from_string(&bucket, "s3-sync-test/baz-1".to_owned()),
-            ObjectKey::from_string(&bucket, "s3-sync-test/baz-2".to_owned()),
-            ObjectKey::from_string(&bucket, "s3-sync-test/bax".to_owned()),
+            BucketKey::from_string(&bucket, "s3-sync-test/baz-1".to_owned()),
+            BucketKey::from_string(&bucket, "s3-sync-test/baz-2".to_owned()),
+            BucketKey::from_string(&bucket, "s3-sync-test/bax".to_owned()),
         ];
 
         for object in objects {
@@ -1068,12 +1073,12 @@ mod tests {
         // two objects in the batch
         assert_eq!(ops[0].len(), 2);
 
-        assert_matches!(&ops[0][0], Ok(Absent(ObjectKey { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][0], Ok(Absent(BucketKey { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/baz-1")
         });
 
-        assert_matches!(&ops[0][1], Ok(Absent(ObjectKey { bucket: Present(Bucket { name }), key })) => {
+        assert_matches!(&ops[0][1], Ok(Absent(BucketKey { bucket: Present(Bucket { name }), key })) => {
                         assert_eq!(name, &s3_test_bucket().name);
                         assert_eq!(key, "s3-sync-test/baz-2")
         });
