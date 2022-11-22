@@ -156,7 +156,7 @@ impl From<chrono::ParseError> for S3SyncError {
     }
 }
 
-/// Represents key to an object key in a bucket.
+/// Represents object as an object key in an S3 bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketKey<'b> {
     pub bucket: &'b Present<Bucket>,
