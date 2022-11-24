@@ -76,9 +76,7 @@ impl<'i, T> Captures1<'i> for T {}
 pub trait Captures2<'i> {}
 impl<'i, T> Captures2<'i> for T {}
 
-const DELETE_BATCH_SIZE: usize = 1000; // how many objects to delete in single batch call
-const MAX_MULTIPART_PARTS: usize = 10_000; // as defined by S3 API limit
-
+/// Possible errors in `s3-sync` library.
 #[derive(Debug)]
 pub enum S3SyncError {
     RusotoError(RusotoError<Box<dyn Error + 'static>>),
@@ -156,7 +154,29 @@ impl From<chrono::ParseError> for S3SyncError {
     }
 }
 
-/// Represents object as an object key in an S3 bucket.
+/// Represents S3 bucket.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Bucket {
+    name: String
+}
+
+impl External for Bucket {}
+
+impl Bucket {
+    /// Creates [Bucket] from bucket name.
+    pub fn from_name(name: String) -> Bucket {
+        Bucket {
+            name
+        }
+    }
+
+    /// Gets bucket name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Represents a pointer to an object in S3 bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketKey<'b> {
     pub bucket: &'b Present<Bucket>,
@@ -166,7 +186,7 @@ pub struct BucketKey<'b> {
 impl External for BucketKey<'_> {}
 
 impl<'b> BucketKey<'b> {
-    /// Creates `BucketKey` from present `Bucket` and given key `String`.
+    /// Creates [BucketKey] from present [Bucket] and given key.
     pub fn from_string(bucket: &Present<Bucket>, key: impl Into<String>) -> BucketKey {
         BucketKey {
             bucket,
@@ -174,12 +194,12 @@ impl<'b> BucketKey<'b> {
         }
     }
 
-    /// Gets objects bucket.
+    /// Gets bucket.
     pub fn bucket(&self) -> &Present<Bucket> {
         self.bucket
     }
 
-    /// Gets object key.
+    /// Gets key.
     pub fn key(&self) -> &str {
         &self.key
     }
@@ -220,40 +240,7 @@ impl<'b> From<Absent<BucketKey<'b>>> for BucketKey<'b> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum LastModified {
-    /// Date and time in RFC2822 format.
-    Rfc2822(String),
-    /// Date and time in RFC3339 format.
-    Rfc3339(String),
-}
-
-impl fmt::Display for LastModified {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl LastModified {
-    /// Gets timestamp string that may be in different format.
-    pub fn as_str(&self) -> &str {
-        match self {
-            LastModified::Rfc2822(dt) => &dt,
-            LastModified::Rfc3339(dt) => &dt,
-        }
-    }
-
-    #[cfg(feature = "chrono")]
-    /// Returns parsed date and time.
-    pub fn parse(&self) -> Result<DateTime<FixedOffset>, S3SyncError> {
-        Ok(match &self {
-            LastModified::Rfc2822(lm) => DateTime::parse_from_rfc2822(lm),
-            LastModified::Rfc3339(lm) => DateTime::parse_from_rfc3339(lm),
-        }?)
-    }
-}
-
-/// Represents existing object in a bucket.
+/// Represents an existing object and its metadata in S3.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Object<'b> {
     pub bucket_key: Present<BucketKey<'b>>,
@@ -284,22 +271,22 @@ impl<'b> Object<'b> {
         })
     }
 
-    /// Gets `BucketKey` reference.
+    /// Gets [BucketKey] pointing to this object.
     pub fn bucket_key(&self) -> &Present<BucketKey<'b>> {
         &self.bucket_key
     }
 
-    /// Unwraps inner `BucketKey`.
+    /// Unwraps inner [BucketKey] pointing to this object.
     pub fn unwrap_bucket_key(self) -> Present<BucketKey<'b>> {
         self.bucket_key
     }
 
-    /// Gets objects bucket.
+    /// Gets bucket in which this object is located.
     pub fn bucket(&self) -> &Present<Bucket> {
         self.bucket_key.bucket
     }
 
-    /// Gets object key string.
+    /// Gets key under which this object is located.
     pub fn key(&self) -> &str {
         &self.bucket_key.key
     }
@@ -320,25 +307,39 @@ impl<'b> Object<'b> {
     }
 }
 
-/// Represents S3 bucket.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
-pub struct Bucket {
-    name: String
+/// Represents last modified time and date.
+///
+/// Depending on the source of the information it will be in different format.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastModified {
+    /// Date and time in RFC2822 format.
+    Rfc2822(String),
+    /// Date and time in RFC3339 format.
+    Rfc3339(String),
 }
 
-impl External for Bucket {}
+impl fmt::Display for LastModified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
-impl Bucket {
-    /// Creates `Bucket` from bucket name `String`.
-    pub fn from_name(name: String) -> Bucket {
-        Bucket {
-            name
+impl LastModified {
+    /// Gets string representation that may be in different format.
+    pub fn as_str(&self) -> &str {
+        match self {
+            LastModified::Rfc2822(dt) => &dt,
+            LastModified::Rfc3339(dt) => &dt,
         }
     }
 
-    /// Gets bucket name.
-    pub fn name(&self) -> &str {
-        &self.name
+    #[cfg(feature = "chrono")]
+    /// Returns parsed date and time.
+    pub fn parse(&self) -> Result<DateTime<FixedOffset>, S3SyncError> {
+        Ok(match &self {
+            LastModified::Rfc2822(lm) => DateTime::parse_from_rfc2822(lm),
+            LastModified::Rfc3339(lm) => DateTime::parse_from_rfc3339(lm),
+        }?)
     }
 }
 
@@ -454,10 +455,38 @@ impl Default for ObjectBodyMeta {
 /// Method used for checking if given object exists
 #[derive(Debug)]
 pub enum CheckObjectImpl {
-    /// Required `GetObject` permission
+    /// Required `GetObject` AWS permission
     Head,
-    /// Required `ListBucket` permission
+    /// Required `ListBucket` AWS permission
     List,
+}
+
+#[derive(Debug)]
+pub struct Settings {
+    /// Size of multipart upload part.
+    ///
+    /// Note: On AWS S3 the part size is must be between 5MiB to 5GiB
+    pub part_size: usize,
+    /// Timeout for non data related operations.
+    pub timeout: Duration,
+    /// Timeout for data upload/download operations.
+    pub data_timeout: Duration,
+    /// Maximum number of multipart uploads (for calcuations of [S3::max_upload_size()]) (AWS limit is 10k)
+    pub max_multipart_upload_parts: usize,
+    /// Maximum number of objects that can be deleted with one API call (AWS limit is 1k)
+    pub max_delete_objects: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            part_size: 10 * 1024 * 1024, // note that max part count is 10k so we can upload up to 100_000 MiB
+            timeout: Duration::from_secs(10),
+            data_timeout: Duration::from_secs(300),
+            max_multipart_upload_parts: 10_000, // ASW S3 limit
+            max_delete_objects: 1_000, // ASW S3 limit
+        }
+    }
 }
 
 /// Wrapper of Rusoto S3 client that adds some high level imperative and declarative operations on
@@ -465,12 +494,11 @@ pub enum CheckObjectImpl {
 pub struct S3 {
     client: S3Client,
     on_upload_progress: Option<RefCell<Box<dyn FnMut(&TransferStatus)>>>,
-    /// Size of multipart upload part.
     part_size: usize,
-    /// Timeout for non data related operations.
     timeout: Duration,
-    /// Timeout for data upload/download operations.
     data_timeout: Duration,
+    max_multipart_upload_parts: usize,
+    max_delete_objects: usize,
 }
 
 impl fmt::Debug for S3 {
@@ -483,26 +511,6 @@ impl fmt::Debug for S3 {
     }
 }
 
-#[derive(Debug)]
-pub struct Settings {
-    /// Size of multipart upload part.
-    pub part_size: usize,
-    /// Timeout for non data related operations.
-    pub timeout: Duration,
-    /// Timeout for data upload/download operations.
-    pub data_timeout: Duration,
-}
-
-impl Default for Settings {
-    fn default() -> Settings {
-        Settings {
-            part_size: 10 * 1024 * 1024, // note that max part count is 10k so we can upload up to 100_000 MiB
-            timeout: Duration::from_secs(10),
-            data_timeout: Duration::from_secs(300),
-        }
-    }
-}
-
 impl Default for S3 {
     fn default() -> S3 {
         S3::new(None, None, None)
@@ -510,11 +518,11 @@ impl Default for S3 {
 }
 
 impl S3 {
-    /// Creates new Rusoto based high level S3 client with default settings.
+    /// Creates high level S3 client.
     ///
-    /// * region - set the AWS region to connect to or try to autodetect the region value
-    /// * region_endpoint - use dedicated AWS endpoint within the region
-    /// * settings - use specific client setting
+    /// * `region` - the AWS region to connect to; when `None` autodetects the region value (see [Region] for detail)
+    /// * `region_endpoint` - use dedicated AWS endpoint within the region
+    /// * `settings` - use specific client setting
     pub fn new(
         region: impl Into<Option<Region>>,
         region_endpoint: impl Into<Option<String>>,
@@ -534,10 +542,12 @@ impl S3 {
             part_size: settings.part_size,
             timeout: settings.timeout,
             data_timeout: settings.data_timeout,
+            max_multipart_upload_parts: settings.max_multipart_upload_parts,
+            max_delete_objects: settings.max_delete_objects,
         }
     }
 
-    /// Creates new Rusoto based high level S3 client with default settings with given region.
+    /// Creates high level S3 client with given region and default settings.
     pub fn with_region(region: Region) -> S3 {
         S3::new(region, None, None)
     }
@@ -549,9 +559,9 @@ impl S3 {
         self.part_size
     }
 
-    /// Returns maximum size of data in bytes that S3 object can be put with.
+    /// Returns maximum size of data in bytes that can be uploaded to a single object with current settings.
     pub fn max_upload_size(&self) -> usize {
-        self.part_size * MAX_MULTIPART_PARTS
+        self.part_size * self.max_multipart_upload_parts
     }
 
     /// Set callback on body upload progress.
@@ -561,7 +571,7 @@ impl S3 {
         ret.map(|c| c.into_inner())
     }
 
-    /// Calls `f` with `S3` client that has `on_upload_progress` set to `callback` and restores
+    /// Calls `f` with [S3] client that has [S3::on_upload_progress()] set to `callback` and restores
     /// callback to previous state on return.
     pub fn with_on_upload_progress<O>(&mut self, callback: impl FnMut(&TransferStatus) + 'static, f: impl FnOnce(&mut Self) -> O) -> O {
         let old = self.on_upload_progress(callback);
@@ -596,7 +606,9 @@ impl S3 {
     ///
     /// * `implementaiton` - select implementation of ths function
     ///
-    /// Warning: last_modified value may be in different format depending on implementation.
+    /// Note:
+    ///
+    /// * [Object::last_modified()] value will be in different format depending on implementation.
     pub fn check_object_exists<'s, 'b>(&'s self, bucket_key: BucketKey<'b>, implementation: CheckObjectImpl)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         match implementation {
@@ -605,12 +617,12 @@ impl S3 {
         }
     }
 
-    /// Checks if given object exists by issuing HeadObject request.
+    /// Checks if given object exists by issuing `HeadObject` API request.
     ///
-    /// If object is present a new object with e_tag, size and last_modified values set is created.
-    /// Warning: The last_modified time will be in RFC 2822 format.
+    /// Note:
     ///
-    /// Requires `GetObject` premission.
+    /// * Requires `GetObject` AWS premission.
+    /// * The [Object::last_modified()] value will be in RFC 2822 format.
     pub fn check_object_exists_head<'s, 'b>(&'s self, bucket_key: BucketKey<'b>)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         let res = self.client.head_object(HeadObjectRequest {
@@ -628,12 +640,12 @@ impl S3 {
         }
     }
 
-    /// Checks if given object exists by listing objects.
+    /// Checks if given object exists by listing objects with `ListObjcetsV2` API request.
     ///
-    /// It will use metadata obtained from S3 if object exists.
-    /// Warning: The last_modified time will be in RFC 3339 format.
+    /// Note:
     ///
-    /// Requires `ListBucket` permission.
+    /// * Requires `ListBucket` AWS permission.
+    /// * The [Object::last_modified()] value will be in RFC 3339 format.
     pub fn check_object_exists_list<'s, 'b>(&'s self, bucket_key: BucketKey<'b>)
         -> Result<Either<Object<'b>, Absent<BucketKey<'b>>>, S3SyncError> {
         let request = ListObjectsV2Request {
@@ -654,7 +666,10 @@ impl S3 {
 
     /// Provides iterator of objects in existing bucket that have key of given prefix.
     ///
-    /// Warning: The last_modified time will be in RFC 3339 format.
+    /// Note:
+    ///
+    /// * Requires `ListBucket` AWS permission.
+    /// * The [Object::last_modified()] value will be in RFC 3339 format.
     pub fn list_objects<'b, 's: 'b>(&'s self, bucket: &'b Present<Bucket>, prefix: String)
         -> impl Iterator<Item = Result<Object<'b>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
         let client = &self.client;
@@ -708,13 +723,15 @@ impl S3 {
         .map(|body| body.into_blocking_read())
     }
 
-    /// Gets object body retrying the operation in case of error.
+    /// Gets object body retrying the operation in case of an error.
     ///
-    /// * retires - retry get_body call up to that many times
-    /// * on_error - called when get_body call fails and there are still retries left; if gets number of retries left and the error and if it returns false the retry loop is aboreted
+    /// * `retires` - retry get_body call up to that many times
+    /// * `on_error` - called when get_body call fails and there are still retries left; if gets number of retries left and the error and if it returns false the retry loop is aboreted
     ///
-    /// Note: The `on_error` closure should potentially pause execution of the thread to deley next retry attempt.
-    /// Note: Once this function returns the subsequent read operation failures are not retried.
+    /// Note:
+    ///
+    /// * The `on_error` closure may need to pause the execution of the thread to deley next retry attempt.
+    /// * Once this function returns, the subsequent read operation failures are not retried.
     pub fn get_body_with_retry<'s, 'b, F>(&'s self, object: &impl Borrow<Present<BucketKey<'b>>>, mut retries: u32, on_error: F)
         -> Result<impl Read, S3SyncError> where F: Fn(u32, &S3SyncError) -> bool {
         loop {
@@ -730,13 +747,13 @@ impl S3 {
         }
     }
 
-    /// Puts object with given body using multipart API.
+    /// Creates the S3 object with given body using multipart upload API.
     ///
-    /// If given existing object it will be overwritten.
+    /// Warning: Existing object will be overwritten (subject to bucket versioning settings).
     ///
-    /// Use `.max_upload_size()` to find out how many bytes the body can have at maximum.
-    /// Increase `part_size` to be able to upload more date (`max_upload_size = part_number *
-    /// 10_000`).
+    /// The size of the body is limited to value returned by [S3::max_upload_size()].
+    /// Increase [Settings::part_size] to be able to upload more data (`max_upload_size = part_size *
+    /// 10_000` on AWS; with default settings the limit is 100_000 MiB).
     pub fn put_object<'s, 'b>(&'s self, bucket_key: impl Into<BucketKey<'b>>, mut body: impl Read, meta: ObjectBodyMeta)
         -> Result<Present<BucketKey<'b>>, S3SyncError> {
         use rusoto_s3::{CreateMultipartUploadRequest, UploadPartRequest, CompleteMultipartUploadRequest, AbortMultipartUploadRequest, CompletedMultipartUpload, CompletedPart};
@@ -848,10 +865,9 @@ impl S3 {
 
     /// Deletes single object.
     ///
-    /// Delete call does not fail if object does not exist.
+    /// Note: Delete call does not fail if object does not exist.
     ///
-    /// To delete many objects it is better performance wise to use `.delete_objects()` witch
-    /// uses bulk delete API.
+    /// To delete many objects use [S3::delete_objects()] witch uses bulk delete API.
     pub fn delete_object<'b, 's: 'b>(&'s self, bucket_key: impl Into<BucketKey<'b>>) -> Result<Absent<BucketKey<'b>>, S3SyncError> {
         let bucket_key = bucket_key.into();
         debug!("Deleting object {:?} from S3 bucket {:?}",bucket_key.key, bucket_key.bucket.name);
@@ -867,8 +883,8 @@ impl S3 {
 
     /// Deletes list of objects in streaming fashion using bulk delete API.
     ///
-    /// Note that if returned iterator is not completely consumed not all items from the list may
-    /// be processed.
+    /// Warning: If returned iterator is not completely consumed not all items from the list may
+    /// be deleted.
     ///
     /// It is not an error to delete non-existing S3 object.
     ///
@@ -876,14 +892,16 @@ impl S3 {
     /// recommended to order the list by bucket so that biggest batches can be crated.
     ///
     /// Each returned item represent batch delete call to S3 API.
-    /// Successful batch call will return `Ok` variant containing vector of results for each
+    ///
+    /// Successful batch call will return [Result::Ok] variant containing vector of results for each
     /// individual object delete operation as provided by S3.
     pub fn delete_objects<'b, 's: 'b>(&'s self, bucket_keys: impl IntoIterator<Item = impl Into<BucketKey<'b>>>) -> impl Iterator<Item = Result<Vec<Result<Absent<BucketKey<'b>>, (BucketKey<'b>, S3SyncError)>>, S3SyncError>> + Captures1<'s> + Captures2<'b> {
+        let max_delete_objects = self.max_delete_objects;
         bucket_keys
             .into_iter()
             .map(|o| o.into())
             .peekable()
-            .batching(|bucket_keys| {
+            .batching(move |bucket_keys| {
                 let current_bucket_name = if let Some(bucket_key) = bucket_keys.peek() {
                     bucket_key.bucket.name.clone()
                 } else {
@@ -893,7 +911,7 @@ impl S3 {
                 Some((current_bucket_name.clone(),
                      bucket_keys
                         .peeking_take_while(move |object| object.bucket.name == current_bucket_name)
-                        .take(DELETE_BATCH_SIZE)
+                        .take(max_delete_objects)
                         .collect::<Vec<_>>()))
             })
             .map(move |(current_bucket_name, bucket_keys): (_, Vec<_>)| {
@@ -955,12 +973,12 @@ impl S3 {
             })
     }
 
-    /// Returns `Ensure` object that can be used to ensure that object is present in the S3 bucket.
+    /// Returns [Ensure] value that can be used to ensure that object is present in the S3 bucket.
     ///
-    /// It will call body function to obtain `Read` object from which the data will be uploaded to S3
-    /// and its meta data if object does not already exist there.
+    /// If S3 object does not exist this method will call `body` function to obtain [Read] and metadata values,
+    /// then data read will be uploaded to the new S3 object with given metadata set on it.
     ///
-    /// Note that there can be a race condition between check if object exists and upload.
+    /// Warning: There can be a race condition between check if object exists and the upload creating it.
     pub fn object_present<'b, 's: 'b, R: Read + 's, F: FnOnce() -> Result<(R, ObjectBodyMeta), std::io::Error> + 's>
         (&'s self, bucket_key: BucketKey<'b>, check_impl: CheckObjectImpl, body: F)
         -> impl Ensure<Present<BucketKey<'b>>, EnsureAction = impl Meet<Met = Present<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
@@ -975,9 +993,9 @@ impl S3 {
         }
     }
 
-    /// Returns `Ensure` object that can be used to ensure that object is absent in the S3 bucket.
+    /// Returns [Ensure] value that can be used to ensure that object is absent in the S3 bucket.
     ///
-    /// Note that there can be a race condition between check if object exists and delete operation.
+    /// Warning: There can be a race condition between check if object exists and the delete operation.
     pub fn object_absent<'b, 's: 'b>(&'s self, bucket_key: BucketKey<'b>, check_impl: CheckObjectImpl) -> impl Ensure<Absent<BucketKey<'b>>, EnsureAction = impl Meet<Met = Absent<BucketKey<'b>>, Error = S3SyncError> + Captures1<'s> + Captures2<'b>> + Captures1<'s> + Captures2<'b> {
         move || {
             Ok(match self.check_object_exists(bucket_key, check_impl)? {
